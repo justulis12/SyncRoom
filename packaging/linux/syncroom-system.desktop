@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SyncRoom
+Comment=Simple synced streaming rooms
+Exec=syncroom-client
+Icon=syncroom
+Terminal=false
+Categories=AudioVideo;Player;
+StartupNotify=true
