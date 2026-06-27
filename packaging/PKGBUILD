@@ -1,0 +1,24 @@
+pkgname=syncroom
+pkgver=0.1.2
+pkgrel=1
+pkgdesc="Simple synced video room client and server"
+arch=('any')
+url="https://example.com/syncroom"
+license=('MIT')
+depends=('python' 'python-pyside6' 'mpv')
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 assets/syncroom.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/syncroom.svg"
+  install -Dm644 packaging/linux/syncroom-system.desktop \
+    "$pkgdir/usr/share/applications/syncroom.desktop"
+}
