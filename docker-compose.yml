@@ -1,0 +1,11 @@
+services:
+  syncroom-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: syncroom-server
+    restart: unless-stopped
+    environment:
+      SYNCROOM_PORT: "24873"
+    ports:
+      - "24873:24873"
