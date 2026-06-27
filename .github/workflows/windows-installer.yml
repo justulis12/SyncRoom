@@ -1,0 +1,53 @@
+name: Build Windows Installer
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller PySide6-Essentials shiboken6 setuptools wheel
+
+      - name: Build app bundle
+        run: pyinstaller --clean --noconfirm packaging/syncroom.spec
+
+      - name: Install Inno Setup
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.5
+        with:
+          path: packaging/windows/SyncRoom.iss
+
+      - name: Publish installer to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer-dist/SyncRoom-Setup.exe
+            dist/SyncRoom/SyncRoomUpdate.exe
+          generate_release_notes: true
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncroom-windows-installer
+          path: |
+            installer-dist/SyncRoom-Setup.exe
+            dist/SyncRoom/SyncRoomUpdate.exe
