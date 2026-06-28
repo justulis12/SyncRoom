@@ -44,12 +44,14 @@ jobs:
         with:
           files: |
             installer-dist/SyncRoom-Setup.exe
+          fail_on_unmatched_files: true
           generate_release_notes: true
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: syncroom-windows-build
+          if-no-files-found: error
           path: |
             installer-dist/SyncRoom-Setup.exe
             dist/SyncRoom/**
