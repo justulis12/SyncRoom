@@ -1,21 +1,41 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
+from typing import Callable
 
 
 WAIT_TIMEOUT_SECONDS = 180
 INSTALLER_TIMEOUT_SECONDS = 600
 INSTALLER_TIMEOUT_EXIT_CODE = 124
 SUCCESS_INSTALLER_EXIT_CODES = {0, 3010}
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_BACKOFF_SECONDS = (1, 3, 6)
+RETRY_HTTP_STATUS_CODES = {429, 502, 503, 504}
+EXPECTED_ASSET_NAME = "syncroom-setup.exe"
+ProgressCallback = Callable[[str, str, int], None]
+
+
+@dataclass(frozen=True)
+class ApplyUpdateRequest:
+    version: str
+    asset_url: str
+    asset_name: str
+    app_path: Path
+    pid: int
 
 
 def logs_dir() -> Path:
@@ -39,6 +59,10 @@ def log_path() -> Path:
     return logs_dir() / "update-helper.log"
 
 
+def installer_log_path() -> Path:
+    return logs_dir() / "installer.log"
+
+
 def append_log(message: str) -> None:
     try:
         path = log_path()
@@ -49,12 +73,22 @@ def append_log(message: str) -> None:
         pass
 
 
-def spawn_detached(arguments: list[str], cwd: Path) -> None:
+def progress_noop(_step: str, _detail: str, _percent: int) -> None:
+    return
+
+
+def emit_progress(progress: ProgressCallback | None, step: str, detail: str, percent: int) -> None:
+    append_log(f"progress step={step!r} detail={detail!r} percent={percent}")
+    if progress is not None:
+        progress(step, detail, max(0, min(100, percent)))
+
+
+def spawn_detached(arguments: list[str], cwd: Path) -> subprocess.Popen:
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     append_log(f"spawn detached command={subprocess.list2cmdline(arguments)} cwd={cwd}")
-    subprocess.Popen(arguments, cwd=str(cwd), close_fds=True, creationflags=creationflags)
+    return subprocess.Popen(arguments, cwd=str(cwd), close_fds=True, creationflags=creationflags)
 
 
 def stage_updater_runtime(current_exe: Path) -> tuple[Path, Path]:
@@ -72,6 +106,10 @@ def stage_updater_runtime(current_exe: Path) -> tuple[Path, Path]:
     return temp_dir, staged_exe
 
 
+def normalized_path(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
 def pid_exists_fallback(pid: int) -> bool:
     result = subprocess.run(
         ["cmd", "/c", f'tasklist /FI "PID eq {pid}" 2>NUL'],
@@ -82,9 +120,21 @@ def pid_exists_fallback(pid: int) -> bool:
     return str(pid) in result.stdout
 
 
+def wait_for_exit_with_tasklist_fallback(pid: int, timeout_seconds: int) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not pid_exists_fallback(pid):
+            append_log(f"target PID exited according to fallback pid={pid}")
+            return True
+        time.sleep(0.5)
+    append_log(f"target PID fallback wait timed out pid={pid}")
+    return False
+
+
 def wait_for_exit(pid: int, timeout_seconds: int = WAIT_TIMEOUT_SECONDS) -> bool:
-    append_log(f"waiting for target PID pid={pid} timeout_seconds={timeout_seconds}")
+    append_log(f"target PID wait start pid={pid} timeout_seconds={timeout_seconds}")
     if os.name != "nt":
+        append_log("target PID wait skipped on non-Windows platform")
         return True
 
     try:
@@ -136,17 +186,6 @@ def wait_for_exit(pid: int, timeout_seconds: int = WAIT_TIMEOUT_SECONDS) -> bool
         return wait_for_exit_with_tasklist_fallback(pid, timeout_seconds)
 
 
-def wait_for_exit_with_tasklist_fallback(pid: int, timeout_seconds: int) -> bool:
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        if not pid_exists_fallback(pid):
-            append_log(f"target PID exited according to fallback pid={pid}")
-            return True
-        time.sleep(0.5)
-    append_log(f"target PID fallback wait timed out pid={pid}")
-    return False
-
-
 def remaining_syncroom_processes(app_path: Path) -> list[tuple[int, str]]:
     if os.name != "nt":
         return []
@@ -196,10 +235,6 @@ def remaining_syncroom_processes(app_path: Path) -> list[tuple[int, str]]:
     return remaining
 
 
-def normalized_path(path: Path) -> str:
-    return os.path.normcase(os.path.abspath(str(path)))
-
-
 def is_running_as_admin() -> bool:
     if os.name != "nt":
         return False
@@ -243,7 +278,12 @@ def installer_arguments(installer_log: Path) -> list[str]:
     ]
 
 
-def run_installer(installer_path: Path, installer_log: Path, app_path: Path) -> int:
+def run_installer(
+    installer_path: Path,
+    installer_log: Path,
+    app_path: Path,
+    progress: ProgressCallback | None = None,
+) -> int:
     args = installer_arguments(installer_log)
     command = [str(installer_path), *args]
     needs_admin = path_is_under_program_files(app_path)
@@ -255,6 +295,7 @@ def run_installer(installer_path: Path, installer_log: Path, app_path: Path) -> 
     )
     append_log(f"installer command {subprocess.list2cmdline(command)}")
     if needs_admin and not is_admin:
+        emit_progress(progress, "Installing update", "Waiting for administrator permission...", 72)
         append_log("installer elevation requested via ShellExecuteEx runas")
         return run_installer_elevated(installer_path, args)
     append_log("installer launch starting without elevation")
@@ -366,8 +407,221 @@ def safe_cleanup_path(path: Path, description: str) -> None:
 
 
 def maybe_cleanup_update_temp(path: Path) -> None:
-    if path.name.startswith("syncroom-update-") or path.name.startswith("syncroom-update-run-"):
+    if path.name.startswith(("syncroom-update-", "syncroom-update-run-", "syncroom-update-download-")):
         safe_cleanup_path(path, "temporary update directory")
+
+
+def _format_download_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code} {exc.reason}"
+    if isinstance(exc, urllib.error.URLError):
+        return str(exc.reason)
+    return str(exc)
+
+
+def _is_retryable_download_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return int(exc.code) in RETRY_HTTP_STATUS_CODES
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    message = str(exc).lower()
+    return "timed out" in message or "temporarily unavailable" in message
+
+
+def download_installer_asset(
+    asset_url: str,
+    asset_name: str,
+    progress: ProgressCallback | None = None,
+) -> Path:
+    if asset_name.lower() != EXPECTED_ASSET_NAME:
+        raise RuntimeError(f"Unexpected update asset: {asset_name}. Expected SyncRoom-Setup.exe.")
+    if not asset_url:
+        raise RuntimeError("No update asset URL was provided.")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="syncroom-update-download-"))
+    destination = temp_dir / "SyncRoom-Setup.exe"
+    partial_path = destination.with_suffix(destination.suffix + ".part")
+    append_log(f"download staging temp_dir={temp_dir} temp_path={partial_path} final_path={destination}")
+    emit_progress(progress, "Downloading update", "Preparing download...", 30)
+
+    last_error = ""
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        expected_bytes = 0
+        downloaded_bytes = 0
+        partial_path.unlink(missing_ok=True)
+        append_log(
+            "download attempt start "
+            f"attempt={attempt}/{DOWNLOAD_ATTEMPTS} url={asset_url} temp_path={partial_path} "
+            f"final_path={destination}"
+        )
+        try:
+            request = urllib.request.Request(asset_url, headers={"User-Agent": "SyncRoomUpdate"})
+            with urllib.request.urlopen(request, timeout=60) as response, partial_path.open("wb") as handle:
+                status_code = int(getattr(response, "status", 200) or 200)
+                expected_bytes = int(response.headers.get("Content-Length") or "0")
+                append_log(
+                    "download response "
+                    f"attempt={attempt}/{DOWNLOAD_ATTEMPTS} status={status_code} expected_bytes={expected_bytes}"
+                )
+                if status_code >= 400:
+                    raise RuntimeError(f"Update download returned HTTP {status_code}.")
+
+                while True:
+                    chunk = response.read(1024 * 128)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    downloaded_bytes += len(chunk)
+                    if expected_bytes > 0:
+                        ratio = min(downloaded_bytes / expected_bytes, 1.0)
+                        percent = 30 + int(ratio * 35)
+                        emit_progress(
+                            progress,
+                            "Downloading update",
+                            f"Downloading SyncRoom-Setup.exe ({int(ratio * 100)}%)...",
+                            percent,
+                        )
+
+            append_log(
+                "download stream ended "
+                f"attempt={attempt}/{DOWNLOAD_ATTEMPTS} downloaded_bytes={downloaded_bytes} "
+                f"expected_bytes={expected_bytes} temp_path={partial_path} final_path={destination}"
+            )
+            if downloaded_bytes <= 0:
+                raise RuntimeError("The downloaded installer was empty.")
+            if expected_bytes > 0 and downloaded_bytes != expected_bytes:
+                raise RuntimeError(
+                    f"Downloaded size mismatch: expected {expected_bytes} bytes, got {downloaded_bytes} bytes."
+                )
+
+            partial_path.replace(destination)
+            final_size = destination.stat().st_size if destination.exists() else 0
+            if final_size <= 0:
+                raise RuntimeError("The downloaded installer was not saved correctly.")
+            append_log(
+                "download attempt succeeded "
+                f"attempt={attempt}/{DOWNLOAD_ATTEMPTS} downloaded_bytes={downloaded_bytes} "
+                f"expected_bytes={expected_bytes} final_path={destination} final_size={final_size}"
+            )
+            emit_progress(progress, "Downloading update", "Download complete.", 65)
+            return destination
+        except Exception as exc:
+            last_error = _format_download_error(exc)
+            downloaded_bytes = partial_path.stat().st_size if partial_path.exists() else downloaded_bytes
+            append_log(
+                "download attempt failed "
+                f"attempt={attempt}/{DOWNLOAD_ATTEMPTS} url={asset_url} status_or_error={last_error} "
+                f"downloaded_bytes={downloaded_bytes} expected_bytes={expected_bytes} "
+                f"temp_path={partial_path} final_path={destination}"
+            )
+            partial_path.unlink(missing_ok=True)
+            if attempt >= DOWNLOAD_ATTEMPTS or not _is_retryable_download_error(exc):
+                break
+            delay = DOWNLOAD_BACKOFF_SECONDS[min(attempt - 1, len(DOWNLOAD_BACKOFF_SECONDS) - 1)]
+            emit_progress(progress, "Downloading update", f"Download failed; retrying in {delay}s...", 32)
+            append_log(f"download retry scheduled delay_seconds={delay} next_attempt={attempt + 1}")
+            time.sleep(delay)
+
+    safe_cleanup_path(temp_dir, "failed download directory")
+    raise RuntimeError(
+        "Could not download the update installer after several attempts."
+        + (f" Last error: {last_error}" if last_error else "")
+    )
+
+
+def validate_apply_request(request: ApplyUpdateRequest) -> None:
+    append_log(
+        "apply request "
+        f"version={request.version} asset_name={request.asset_name} asset_url={request.asset_url} "
+        f"app_path={request.app_path} target_pid={request.pid}"
+    )
+    if request.asset_name.lower() != EXPECTED_ASSET_NAME:
+        raise RuntimeError(f"Unexpected asset name: {request.asset_name}. Expected SyncRoom-Setup.exe.")
+    if not request.asset_url:
+        raise RuntimeError("No asset URL was provided.")
+    if request.pid <= 0:
+        raise RuntimeError(f"Invalid target PID: {request.pid}")
+    if not request.app_path.exists():
+        raise RuntimeError(f"SyncRoom.exe was not found at {request.app_path}")
+
+
+def apply_update_stage2(request: ApplyUpdateRequest, progress: ProgressCallback | None = None) -> int:
+    current_exe = Path(sys.executable).resolve()
+    installer_path: Path | None = None
+    emit_progress(progress, "Preparing update", f"Installing {request.version}", 8)
+    validate_apply_request(request)
+    append_log(f"log path={log_path()}")
+    append_log(f"installer_log={installer_log_path()}")
+    append_log(f"current_executable={current_exe}")
+    append_log(f"current_working_directory={Path.cwd()}")
+
+    emit_progress(progress, "Closing SyncRoom", "Waiting for SyncRoom to close...", 18)
+    wait_result = wait_for_exit(request.pid)
+    append_log(f"target PID wait result pid={request.pid} exited={wait_result}")
+    if not wait_result:
+        raise RuntimeError("Timed out while waiting for SyncRoom to close.")
+
+    emit_progress(progress, "Closing SyncRoom", "Checking for remaining SyncRoom processes...", 24)
+    remaining = remaining_syncroom_processes(request.app_path)
+    append_log(f"remaining SyncRoom.exe check result={remaining!r}")
+    if remaining:
+        raise RuntimeError("SyncRoom.exe is still running from the install directory.")
+
+    installer_path = download_installer_asset(request.asset_url, request.asset_name, progress)
+    append_log(
+        f"installer ready path={installer_path} size={installer_path.stat().st_size if installer_path.exists() else 0}"
+    )
+
+    emit_progress(progress, "Installing update", f"Installing {request.version}...", 70)
+    exit_code = run_installer(installer_path, installer_log_path(), request.app_path, progress)
+    append_log(f"installer exit code {exit_code}")
+    if exit_code == 1223:
+        raise RuntimeError("Update canceled because administrator permission was not granted.")
+    if exit_code not in SUCCESS_INSTALLER_EXIT_CODES:
+        raise RuntimeError(f"Installer failed with exit code {exit_code}.")
+
+    emit_progress(progress, "Relaunching SyncRoom", "Opening SyncRoom...", 92)
+    if not request.app_path.exists():
+        raise RuntimeError(f"SyncRoom.exe was missing after install: {request.app_path}")
+    process = spawn_detached([str(request.app_path)], request.app_path.parent)
+    append_log(f"app relaunch requested pid={process.pid} path={request.app_path}")
+
+    emit_progress(progress, "Done", "SyncRoom has been updated.", 100)
+    append_log("cleanup starting")
+    if installer_path is not None:
+        maybe_cleanup_update_temp(installer_path.parent)
+    maybe_cleanup_update_temp(current_exe.parent)
+    append_log("stage2 apply update complete")
+    return 0
+
+
+def apply_legacy_stage2(installer_path: Path, app_path: Path, pid: int) -> int:
+    append_log(
+        f"legacy stage2 installer_path={installer_path} app_path={app_path} pid={pid} "
+        f"installer_exists={installer_path.exists()}"
+    )
+    if not installer_path.exists() or installer_path.stat().st_size <= 0:
+        append_log("legacy installer path is missing or empty")
+        return 1
+    if not wait_for_exit(pid):
+        append_log("legacy target PID wait failed")
+        return 1
+    remaining = remaining_syncroom_processes(app_path)
+    if remaining:
+        append_log(f"legacy remaining SyncRoom.exe processes found: {remaining!r}")
+        return 1
+    exit_code = run_installer(installer_path, installer_log_path(), app_path)
+    if exit_code not in SUCCESS_INSTALLER_EXIT_CODES:
+        append_log(f"legacy installer failed exit_code={exit_code}")
+        return 1
+    if app_path.exists():
+        spawn_detached([str(app_path)], app_path.parent)
+    maybe_cleanup_update_temp(installer_path.parent)
+    maybe_cleanup_update_temp(Path(sys.executable).resolve().parent)
+    append_log("legacy stage2 complete")
+    return 0
 
 
 def log_startup(stage: str) -> None:
@@ -379,6 +633,20 @@ def log_startup(stage: str) -> None:
     append_log(f"stage={stage}")
     append_log(f"frozen={getattr(sys, 'frozen', False)}")
     append_log(f"windows_user_admin={is_running_as_admin()}")
+
+
+def verify_ui_import() -> bool:
+    try:
+        from PySide6.QtCore import Qt  # noqa: F401
+        from PySide6.QtGui import QGuiApplication  # noqa: F401
+        from PySide6.QtWidgets import QApplication  # noqa: F401
+
+        append_log("self-test UI import succeeded")
+        return True
+    except Exception:
+        append_log("self-test UI import failed")
+        append_log(traceback.format_exc().strip())
+        return False
 
 
 def self_test() -> int:
@@ -414,101 +682,322 @@ def self_test() -> int:
         if temp_dir is not None:
             safe_cleanup_path(temp_dir, "self-test staged updater")
 
+    if not verify_ui_import():
+        return 1
+
     append_log("self-test completed successfully")
     print(f"SyncRoomUpdate self-test OK; log: {log_path()}")
     return 0
 
 
-def main() -> int:
+def run_ui_self_test() -> int:
     try:
-        stage = "self-test" if "--self-test" in sys.argv else (
-            "stage2" if len(sys.argv) >= 2 and sys.argv[1] == "--stage2" else "stage1"
+        return run_with_ui(
+            lambda progress: (
+                emit_progress(progress, "Preparing update", "UI self-test starting...", 15),
+                time.sleep(0.4),
+                emit_progress(progress, "Downloading update", "Checking progress display...", 45),
+                time.sleep(0.4),
+                emit_progress(progress, "Done", "UI self-test complete.", 100),
+                0,
+            )[-1],
+            version="UI self-test",
         )
+    except Exception:
+        append_log("ui-self-test failed")
+        append_log(traceback.format_exc().strip())
+        return 1
+
+
+def run_with_ui(worker_callback: Callable[[ProgressCallback], int], version: str) -> int:
+    try:
+        from PySide6.QtCore import QObject, QThread, QTimer, Signal
+        from PySide6.QtWidgets import (
+            QApplication,
+            QFrame,
+            QHBoxLayout,
+            QLabel,
+            QProgressBar,
+            QPushButton,
+            QVBoxLayout,
+            QWidget,
+        )
+    except Exception:
+        append_log("UI initialization import failed; continuing headless")
+        append_log(traceback.format_exc().strip())
+        return worker_callback(progress_noop)
+
+    class Worker(QObject):
+        progress = Signal(str, str, int)
+        finished = Signal(int)
+        failed = Signal(str)
+
+        def run(self) -> None:
+            try:
+                exit_code = worker_callback(lambda step, detail, percent: self.progress.emit(step, detail, percent))
+            except Exception as exc:
+                append_log("worker failed")
+                append_log(traceback.format_exc().strip())
+                self.failed.emit(str(exc))
+                return
+            self.finished.emit(exit_code)
+
+    class UpdaterWindow(QWidget):
+        def __init__(self) -> None:
+            super().__init__()
+            self.setWindowTitle("Updating SyncRoom")
+            self.setFixedSize(460, 260)
+            self.close_button = QPushButton("Close")
+            self.close_button.setObjectName("secondaryButton")
+            self.close_button.hide()
+            self.close_button.clicked.connect(self.close)
+
+            shell = QVBoxLayout(self)
+            shell.setContentsMargins(18, 18, 18, 18)
+            shell.setSpacing(0)
+            card = QFrame()
+            card.setObjectName("updateCard")
+            layout = QVBoxLayout(card)
+            layout.setContentsMargins(24, 24, 24, 22)
+            layout.setSpacing(12)
+
+            eyebrow = QLabel("SYNCROOM UPDATE")
+            eyebrow.setObjectName("eyebrow")
+            title = QLabel("Updating SyncRoom")
+            title.setObjectName("title")
+            self.step_label = QLabel("Preparing update")
+            self.step_label.setObjectName("step")
+            self.detail_label = QLabel("Starting updater...")
+            self.detail_label.setObjectName("detail")
+            self.detail_label.setWordWrap(True)
+            self.progress_bar = QProgressBar()
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setTextVisible(False)
+            self.version_label = QLabel(f"Installing {version}")
+            self.version_label.setObjectName("version")
+
+            button_row = QHBoxLayout()
+            button_row.addStretch(1)
+            button_row.addWidget(self.close_button)
+
+            layout.addWidget(eyebrow)
+            layout.addWidget(title)
+            layout.addSpacing(4)
+            layout.addWidget(self.step_label)
+            layout.addWidget(self.detail_label)
+            layout.addWidget(self.progress_bar)
+            layout.addWidget(self.version_label)
+            layout.addStretch(1)
+            layout.addLayout(button_row)
+            shell.addWidget(card)
+
+            self.setStyleSheet(
+                """
+                QWidget {
+                    background: #000000;
+                    color: #f7f7f8;
+                    font-family: "Noto Sans", "Segoe UI", sans-serif;
+                }
+                QFrame#updateCard {
+                    background: #080808;
+                    border: 1px solid #303034;
+                    border-radius: 14px;
+                }
+                QLabel#eyebrow {
+                    color: #a3a3aa;
+                    font-size: 10px;
+                    font-weight: 800;
+                    letter-spacing: 0.12em;
+                }
+                QLabel#title {
+                    color: #ffffff;
+                    font-size: 24px;
+                    font-weight: 800;
+                }
+                QLabel#step {
+                    color: #f3f3f5;
+                    font-size: 15px;
+                    font-weight: 700;
+                }
+                QLabel#detail, QLabel#version {
+                    color: #a8a8af;
+                    font-size: 12px;
+                }
+                QProgressBar {
+                    min-height: 8px;
+                    max-height: 8px;
+                    border-radius: 4px;
+                    border: 1px solid #333338;
+                    background: #111112;
+                }
+                QProgressBar::chunk {
+                    border-radius: 4px;
+                    background: #eeeeef;
+                }
+                QPushButton#secondaryButton {
+                    min-width: 86px;
+                    min-height: 32px;
+                    border-radius: 8px;
+                    color: #eeeeef;
+                    background: #151516;
+                    border: 1px solid #36363a;
+                    font-weight: 700;
+                }
+                QPushButton#secondaryButton:hover {
+                    background: #202023;
+                }
+                """
+            )
+
+        def set_progress(self, step: str, detail: str, percent: int) -> None:
+            self.step_label.setText(step)
+            self.detail_label.setText(detail)
+            self.progress_bar.setValue(max(0, min(100, percent)))
+
+        def show_failure(self, message: str) -> None:
+            self.step_label.setText("Update failed")
+            self.detail_label.setText(f"{message}\n\nLog folder: {logs_dir()}")
+            self.progress_bar.setValue(0)
+            self.close_button.show()
+
+    try:
+        app = QApplication.instance() or QApplication(sys.argv[:1])
+        window = UpdaterWindow()
+        window.show()
+        append_log("UI start succeeded")
+    except Exception:
+        append_log("UI window creation failed; continuing headless")
+        append_log(traceback.format_exc().strip())
+        return worker_callback(progress_noop)
+
+    worker = Worker()
+    thread = QThread()
+    worker.moveToThread(thread)
+    worker.progress.connect(window.set_progress)
+    thread.started.connect(worker.run)
+    result = {"code": 1}
+
+    def finish(exit_code: int) -> None:
+        result["code"] = exit_code
+        thread.quit()
+        if exit_code == 0:
+            window.set_progress("Done", "SyncRoom has been updated.", 100)
+            QTimer.singleShot(900, app.quit)
+        else:
+            window.show_failure(f"Updater exited with code {exit_code}.")
+
+    def fail(message: str) -> None:
+        result["code"] = 1
+        thread.quit()
+        window.show_failure(message)
+
+    worker.finished.connect(finish)
+    worker.failed.connect(fail)
+    thread.start()
+    app.exec()
+    if thread.isRunning():
+        thread.quit()
+        thread.wait(2000)
+    return int(result["code"])
+
+
+def stage1_apply_update(request: ApplyUpdateRequest) -> int:
+    current_exe = Path(sys.executable).resolve()
+    temp_dir, staged_exe = stage_updater_runtime(current_exe)
+    command = [
+        str(staged_exe),
+        "--stage2",
+        "--apply-update",
+        "--version",
+        request.version,
+        "--asset-url",
+        request.asset_url,
+        "--asset-name",
+        request.asset_name,
+        "--app-path",
+        str(request.app_path),
+        "--pid",
+        str(request.pid),
+    ]
+    process = spawn_detached(command, temp_dir)
+    append_log(f"stage1 launched stage2 pid={process.pid} staged_exe={staged_exe}")
+    append_log("stage1 complete")
+    return 0
+
+
+def parse_apply_request(namespace: argparse.Namespace) -> ApplyUpdateRequest:
+    return ApplyUpdateRequest(
+        version=str(namespace.version or "").strip(),
+        asset_url=str(namespace.asset_url or "").strip(),
+        asset_name=str(namespace.asset_name or "").strip(),
+        app_path=Path(str(namespace.app_path)).resolve(),
+        pid=int(namespace.pid),
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="SyncRoom updater helper")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--ui-self-test", action="store_true")
+    parser.add_argument("--stage2", action="store_true")
+    parser.add_argument("--apply-update", action="store_true")
+    parser.add_argument("--version", default="")
+    parser.add_argument("--asset-url", default="")
+    parser.add_argument("--asset-name", default="")
+    parser.add_argument("--app-path", default="")
+    parser.add_argument("--pid", type=int, default=0)
+    parser.add_argument("legacy", nargs="*")
+    return parser
+
+
+def main() -> int:
+    namespace = build_parser().parse_args()
+    stage = "self-test"
+    if namespace.ui_self_test:
+        stage = "ui-self-test"
+    elif namespace.apply_update:
+        stage = "stage2" if namespace.stage2 else "stage1"
+    elif namespace.stage2:
+        stage = "legacy-stage2"
+    elif namespace.legacy:
+        stage = "legacy-stage1"
+    try:
         log_startup(stage)
-        if "--self-test" in sys.argv:
+        if namespace.self_test:
             return self_test()
+        if namespace.ui_self_test:
+            return run_ui_self_test()
+
+        if namespace.apply_update:
+            request = parse_apply_request(namespace)
+            if namespace.stage2:
+                return run_with_ui(lambda progress: apply_update_stage2(request, progress), request.version)
+            return stage1_apply_update(request)
 
         if os.name != "nt":
-            append_log("Updater only supports Windows; exiting.")
+            append_log("Updater only supports Windows for install mode; exiting.")
             return 1
-        if len(sys.argv) < 4:
+        if len(namespace.legacy) < 3:
             append_log(f"Invalid updater arguments: {sys.argv!r}")
             return 1
 
-        stage2 = len(sys.argv) >= 5 and sys.argv[1] == "--stage2"
-        arg_offset = 2 if stage2 else 1
-        installer_path = Path(sys.argv[arg_offset]).resolve()
-        app_path = Path(sys.argv[arg_offset + 1]).resolve()
-        pid = int(sys.argv[arg_offset + 2])
-        installer_log = logs_dir() / "installer.log"
-        current_exe = Path(sys.executable).resolve()
-
-        append_log(f"received target PID pid={pid}")
-        append_log(
-            f"installer_path={installer_path} exists={installer_path.exists()} "
-            f"size={installer_path.stat().st_size if installer_path.exists() else 0}"
-        )
-        append_log(f"app_path={app_path} exists={app_path.exists()}")
-        append_log(f"app_path_under_program_files={path_is_under_program_files(app_path)}")
-        append_log(f"installer_log={installer_log}")
-
-        if not stage2:
-            temp_dir, staged_exe = stage_updater_runtime(current_exe)
-            append_log(
-                f"stage1 launching stage2 staged_exe={staged_exe} installer={installer_path} "
-                f"app={app_path} pid={pid}"
-            )
-            spawn_detached(
+        if not namespace.stage2:
+            installer_path = Path(namespace.legacy[0]).resolve()
+            app_path = Path(namespace.legacy[1]).resolve()
+            pid = int(namespace.legacy[2])
+            temp_dir, staged_exe = stage_updater_runtime(Path(sys.executable).resolve())
+            process = spawn_detached(
                 [str(staged_exe), "--stage2", str(installer_path), str(app_path), str(pid)],
                 temp_dir,
             )
-            append_log("stage1 complete")
+            append_log(f"legacy stage1 launched stage2 pid={process.pid}")
             return 0
 
-        append_log("stage2 validation starting")
-        if not installer_path.exists():
-            append_log("Installer path does not exist; aborting update.")
-            return 1
-        if installer_path.stat().st_size <= 0:
-            append_log("Installer path exists but is empty; aborting update.")
-            return 1
-        if not app_path.exists():
-            append_log("App path does not exist before install; aborting update.")
-            return 1
-
-        wait_result = wait_for_exit(pid)
-        append_log(f"target PID wait result pid={pid} exited={wait_result}")
-        if not wait_result:
-            append_log("Timed out while waiting for SyncRoom to exit; aborting installer launch.")
-            return 1
-
-        remaining = remaining_syncroom_processes(app_path)
-        append_log(f"remaining SyncRoom.exe check result={remaining!r}")
-        if remaining:
-            append_log("SyncRoom.exe is still running from the install directory; aborting installer launch.")
-            return 1
-
-        append_log("installer launch starting after app exit verification")
-        exit_code = run_installer(installer_path, installer_log, app_path)
-        append_log(f"installer exit code {exit_code}")
-
-        if exit_code not in SUCCESS_INSTALLER_EXIT_CODES:
-            append_log(f"installer failed exit_code={exit_code}")
-            return 1
-
-        if app_path.exists():
-            append_log(f"app relaunch starting path={app_path}")
-            spawn_detached([str(app_path)], app_path.parent)
-            append_log("app relaunch requested")
-        else:
-            append_log(f"app relaunch skipped because app path is missing: {app_path}")
-            return 1
-
-        append_log("cleanup starting")
-        maybe_cleanup_update_temp(installer_path.parent)
-        maybe_cleanup_update_temp(current_exe.parent)
-        append_log("stage2 complete")
-        return 0
+        installer_path = Path(namespace.legacy[0]).resolve()
+        app_path = Path(namespace.legacy[1]).resolve()
+        pid = int(namespace.legacy[2])
+        return apply_legacy_stage2(installer_path, app_path, pid)
     except Exception:
         append_log("Unhandled updater exception")
         append_log(traceback.format_exc().strip())

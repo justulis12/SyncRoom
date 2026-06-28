@@ -39,14 +39,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from syncroom import __version__
 from syncroom.mpv_controller import MpvController
 from syncroom.protocol import decode_message, encode_message
 from syncroom.settings import app_config_dir, default_display_name, load_settings, logs_dir, save_settings
 from syncroom.updates import (
     UpdateInfo,
     check_for_updates,
-    cleanup_update_download,
-    download_update_asset,
 )
 from syncroom.windows_runtime import ensure_windows_mpv_runtime
 
@@ -306,27 +305,6 @@ class UpdateCheckWorker(QObject):
         self.finished.emit(check_for_updates())
 
 
-class UpdateDownloadWorker(QObject):
-    progress = Signal(str, int)
-    finished = Signal(str)
-    failed = Signal(str)
-
-    def __init__(self, info: UpdateInfo) -> None:
-        super().__init__()
-        self.info = info
-
-    def run(self) -> None:
-        try:
-            path = download_update_asset(self.info, self._report)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-            return
-        self.finished.emit(str(path))
-
-    def _report(self, message: str, percent: int) -> None:
-        self.progress.emit(message, percent)
-
-
 class ProgressScreenDialog(QDialog):
     def __init__(self, eyebrow_text: str, title_text: str, subtitle_text: str) -> None:
         super().__init__()
@@ -419,91 +397,116 @@ class StartupSetupDialog(ProgressScreenDialog):
         )
 
 
-class UpdateInstallDialog(ProgressScreenDialog):
-    def __init__(self) -> None:
-        super().__init__(
-            "UPDATING SYNCROOM",
-            "Installing the new version",
-            "SyncRoom is applying the update and will reopen automatically when it finishes.",
-        )
-
-
-class UpdateProgressDialog(QDialog):
-    def __init__(self) -> None:
+class UpdateAvailableDialog(QDialog):
+    def __init__(self, current_version: str, latest_version: str) -> None:
         super().__init__()
         self.setWindowTitle("SyncRoom Update")
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
-        self.setWindowFlag(Qt.WindowCloseButtonHint, False)
         self.setModal(True)
-        self.setFixedSize(520, 220)
+        self.setFixedSize(460, 300)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 28, 28, 28)
-        layout.setSpacing(14)
+        shell = QVBoxLayout(self)
+        shell.setContentsMargins(18, 18, 18, 18)
+        shell.setSpacing(0)
 
-        eyebrow = QLabel("UPDATE")
-        eyebrow.setObjectName("eyebrow")
-        title = QLabel("Installing the latest SyncRoom")
-        title.setObjectName("title")
-        subtitle = QLabel(
-            "SyncRoom is downloading the new installer. The app will close and relaunch when the update finishes."
-        )
-        subtitle.setObjectName("subtitle")
-        subtitle.setWordWrap(True)
+        card = QFrame()
+        card.setObjectName("updateCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(24, 24, 24, 22)
+        card_layout.setSpacing(14)
 
-        self.status_label = QLabel("Preparing update...")
-        self.status_label.setObjectName("setupStatus")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
+        eyebrow = QLabel("UPDATE AVAILABLE")
+        eyebrow.setObjectName("updateEyebrow")
+        title = QLabel("A new SyncRoom is ready")
+        title.setObjectName("updateTitle")
+        title.setWordWrap(True)
+        body = QLabel("SyncRoom will close, update, and reopen automatically.")
+        body.setObjectName("updateBody")
+        body.setWordWrap(True)
 
-        layout.addWidget(eyebrow)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addStretch(1)
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.progress_bar)
+        version_text = QLabel(f"Current {current_version}  |  Latest {latest_version}")
+        version_text.setObjectName("updateVersion")
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        buttons.addStretch(1)
+        later_button = QPushButton("Later")
+        later_button.setObjectName("secondaryButton")
+        update_button = QPushButton("Update now")
+        update_button.setObjectName("primaryButton")
+        update_button.setDefault(True)
+        buttons.addWidget(later_button)
+        buttons.addWidget(update_button)
+
+        card_layout.addWidget(eyebrow)
+        card_layout.addWidget(title)
+        card_layout.addWidget(body)
+        card_layout.addWidget(version_text)
+        card_layout.addStretch(1)
+        card_layout.addLayout(buttons)
+        shell.addWidget(card)
+
+        later_button.clicked.connect(self.reject)
+        update_button.clicked.connect(self.accept)
 
         self.setStyleSheet(
             """
             QDialog {
-                background: #050505;
-                color: #f2f2f4;
+                background: #000000;
+                color: #f6f6f7;
                 font-family: "Noto Sans", "Cantarell", sans-serif;
             }
-            QLabel#eyebrow {
-                color: #b8b8bf;
+            QFrame#updateCard {
+                background: #080808;
+                border: 1px solid #303034;
+                border-radius: 14px;
+            }
+            QLabel#updateEyebrow {
+                color: #a6a6ad;
                 font-size: 11px;
                 font-weight: 800;
                 letter-spacing: 0.12em;
             }
-            QLabel#title {
+            QLabel#updateTitle {
                 color: #ffffff;
-                font-size: 28px;
+                font-size: 24px;
                 font-weight: 800;
             }
-            QLabel#subtitle, QLabel#setupStatus {
-                color: #b9b9c0;
+            QLabel#updateBody {
+                color: #c8c8ce;
                 font-size: 14px;
+                line-height: 1.3;
             }
-            QProgressBar {
-                min-height: 18px;
-                border-radius: 9px;
-                border: 1px solid #525257;
-                background: #101011;
-                color: #f3f3f5;
-                text-align: center;
+            QLabel#updateVersion {
+                color: #8f8f98;
+                font-size: 12px;
             }
-            QProgressBar::chunk {
+            QPushButton {
+                min-width: 96px;
+                min-height: 34px;
                 border-radius: 8px;
-                background: #f0f0f2;
+                padding: 0 16px;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QPushButton#primaryButton {
+                color: #050505;
+                background: #f2f2f4;
+                border: 1px solid #ffffff;
+            }
+            QPushButton#primaryButton:hover {
+                background: #ffffff;
+            }
+            QPushButton#secondaryButton {
+                color: #eeeeef;
+                background: #151516;
+                border: 1px solid #36363a;
+            }
+            QPushButton#secondaryButton:hover {
+                background: #202023;
             }
             """
         )
-
-    def set_progress(self, message: str, percent: int) -> None:
-        self.status_label.setText(message)
-        self.progress_bar.setValue(percent)
 
 
 def prepare_windows_runtime_if_needed() -> bool:
@@ -623,7 +626,6 @@ class MainWindow(QMainWindow):
         self.pending_update_info: UpdateInfo | None = None
         self.update_check_started = False
         self.update_prompted_version = ""
-        self.update_installer_path: Path | None = None
         self.update_in_progress = False
         self.last_applied_seek_token = 0
         self.last_applied_event_id = 0
@@ -2551,18 +2553,9 @@ class MainWindow(QMainWindow):
     def prompt_for_update(self, info: UpdateInfo) -> None:
         packaged_windows_build = os.name == "nt" and getattr(sys, "frozen", False)
         if packaged_windows_build and info.asset_url:
-            result = QMessageBox.question(
-                self,
-                "SyncRoom Update",
-                (
-                    f"SyncRoom {info.latest_version} is available.\n\n"
-                    "Install it now? SyncRoom will close, update, and reopen automatically."
-                ),
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
-            )
-            if result == QMessageBox.Yes:
-                self.download_and_install_update(info)
+            dialog = UpdateAvailableDialog(__version__, info.latest_version)
+            if dialog.exec() == QDialog.Accepted:
+                self.launch_bundled_updater_and_exit(info)
             return
 
         if os.name == "nt" and getattr(sys, "frozen", False) and not info.asset_url:
@@ -2589,68 +2582,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, 5000)
         QMessageBox.warning(self, "SyncRoom Update", f"{message}\n\n{log_hint}")
 
-    def download_and_install_update(self, info: UpdateInfo) -> None:
-        append_update_log(
-            f"Starting update download latest_version={info.latest_version} asset={info.asset_name or '<none>'}"
-        )
-        dialog = UpdateProgressDialog()
-        worker = UpdateDownloadWorker(info)
-        thread = QThread(self)
-        self._track_background_job(thread, worker)
-        worker.moveToThread(thread)
-        worker.progress.connect(dialog.set_progress)
-        thread.started.connect(worker.run)
-
-        state = {
-            "failure_message": "",
-            "downloaded_path": "",
-            "accepted": False,
-        }
-
-        def remember_failure(message: str) -> None:
-            state["failure_message"] = message
-            dialog.set_progress(message, 0)
-            append_update_log(f"Update download failed: {message}")
-            thread.quit()
-            dialog.reject()
-
-        def remember_path(path: str) -> None:
-            state["downloaded_path"] = path
-            state["accepted"] = True
-            dialog.set_progress("Preparing installer...", 100)
-            append_update_log(f"Update downloaded successfully to {path}")
-            thread.quit()
-            dialog.accept()
-
-        worker.failed.connect(remember_failure)
-        worker.finished.connect(remember_path)
-        thread.start()
-        dialog.set_progress("Preparing update...", 0)
-        result = dialog.exec()
-        stopped_cleanly = stop_thread_with_timeout(
-            thread,
-            append_update_log,
-            "Update download",
-        )
-        self._release_background_job(thread, worker)
-        if result == QDialog.Accepted and not stopped_cleanly:
-            state["failure_message"] = (
-                "The update downloaded, but the download worker did not stop cleanly."
-            )
-            result = QDialog.Rejected
-
-        if result != QDialog.Accepted:
-            if state["downloaded_path"]:
-                cleanup_update_download(Path(state["downloaded_path"]))
-            self.show_update_error(
-                state["failure_message"] or "SyncRoom could not download the update."
-            )
-            return
-
-        self.update_installer_path = Path(state["downloaded_path"])
-        self.launch_update_installer_and_exit(self.update_installer_path)
-
-    def launch_update_installer_and_exit(self, installer_path: Path) -> None:
+    def launch_bundled_updater_and_exit(self, info: UpdateInfo) -> None:
+        append_update_log("update accepted by user")
         if os.name != "nt" or not getattr(sys, "frozen", False):
             append_update_log("Automatic in-app updating requested outside packaged Windows build")
             self.show_update_error(
@@ -2658,10 +2591,15 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if not installer_path.exists() or installer_path.stat().st_size <= 0:
-            append_update_log(f"Installer path invalid or empty: {installer_path}")
-            self.show_update_error("The downloaded installer is missing or empty.")
-            cleanup_update_download(installer_path)
+        if not info.asset_url:
+            append_update_log("Update handoff rejected because asset_url is missing")
+            self.show_update_error("The latest release does not include a downloadable installer.")
+            return
+        if info.asset_name.lower() != "syncroom-setup.exe":
+            append_update_log(
+                f"Update handoff rejected because asset_name={info.asset_name or '<none>'}"
+            )
+            self.show_update_error("The latest release did not include SyncRoom-Setup.exe.")
             return
 
         app_path = Path(
@@ -2676,16 +2614,27 @@ class MainWindow(QMainWindow):
             self.show_update_error("SyncRoomUpdate.exe was not found next to the app.")
             return
         append_update_log(
-            f"updater launch requested updater={updater_path} installer={installer_path}"
+            "updater launch requested "
+            f"updater={updater_path} app_path={app_path} pid={os.getpid()} "
+            f"latest_version={info.latest_version} asset_name={info.asset_name} asset_url={info.asset_url}"
         )
+        command = [
+            str(updater_path),
+            "--apply-update",
+            "--version",
+            info.latest_version,
+            "--asset-url",
+            info.asset_url,
+            "--asset-name",
+            info.asset_name,
+            "--app-path",
+            str(app_path),
+            "--pid",
+            str(os.getpid()),
+        ]
         try:
             process = subprocess.Popen(
-                [
-                    str(updater_path),
-                    str(installer_path),
-                    str(app_path),
-                    str(os.getpid()),
-                ],
+                command,
                 creationflags=creationflags,
                 close_fds=True,
                 cwd=str(app_path.parent),
@@ -2693,20 +2642,23 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             append_update_log(f"Bundled updater launch failed: {exc}")
             self.show_update_error(f"Could not launch the updater: {exc}")
-            cleanup_update_download(installer_path)
             return
         append_update_log(f"updater process PID pid={process.pid}")
         self.update_in_progress = True
         append_update_log("update handoff flag set")
-        self.show_status("Closing SyncRoom so the updater can finish the install...")
-        self.best_effort_update_shutdown()
         self.hide()
         append_update_log("main window hidden")
-        QTimer.singleShot(2500, self.force_update_handoff_exit)
         app = QApplication.instance()
         if app is not None:
-            append_update_log("QApplication.quit requested")
-            app.quit()
+            app.processEvents()
+        self.best_effort_update_shutdown()
+        append_update_log("hard exit starting")
+        if _FAULT_LOG_HANDLE is not None:
+            try:
+                _FAULT_LOG_HANDLE.flush()
+            except Exception:
+                pass
+        os._exit(0)
 
     def best_effort_update_shutdown(self) -> None:
         try:
@@ -2728,8 +2680,7 @@ class MainWindow(QMainWindow):
             try:
                 if thread.isRunning():
                     thread.quit()
-                    if not thread.wait(250):
-                        append_update_log("background worker still running during update handoff")
+                    append_update_log("background worker quit requested during update handoff")
             except Exception as exc:
                 append_update_log(f"background worker shutdown failed during update handoff: {exc}")
 
