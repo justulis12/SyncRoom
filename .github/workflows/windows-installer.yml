@@ -1,0 +1,94 @@
+name: Build Windows Installer
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller PySide6-Essentials shiboken6 setuptools wheel
+
+      - name: Check version sync
+        run: python scripts/check_version_sync.py
+
+      - name: Build app bundle
+        run: pyinstaller --clean --noconfirm packaging/syncroom.spec
+
+      - name: Verify app bundle
+        run: |
+          if (!(Test-Path "dist/SyncRoom/SyncRoom.exe")) { throw "dist/SyncRoom/SyncRoom.exe is missing" }
+          if (!(Test-Path "dist/SyncRoom/SyncRoomUpdate.exe")) { throw "dist/SyncRoom/SyncRoomUpdate.exe is missing" }
+          if (!(Test-Path "dist/SyncRoom/_internal")) { throw "dist/SyncRoom/_internal is missing" }
+          tree /F dist\SyncRoom
+
+      - name: Run updater self-test
+        id: updater_self_test
+        continue-on-error: true
+        run: dist/SyncRoom/SyncRoomUpdate.exe --self-test
+
+      - name: Collect updater self-test log on failure
+        if: steps.updater_self_test.outcome == 'failure'
+        run: |
+          $logPath = Join-Path $env:APPDATA "syncroom\logs\update-helper.log"
+          if (Test-Path $logPath) {
+            Copy-Item $logPath (Join-Path $env:RUNNER_TEMP "update-helper.log")
+          }
+
+      - name: Upload updater self-test log on failure
+        if: steps.updater_self_test.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-helper-log
+          if-no-files-found: warn
+          path: ${{ runner.temp }}\update-helper.log
+
+      - name: Fail after updater self-test failure
+        if: steps.updater_self_test.outcome == 'failure'
+        run: exit 1
+
+      - name: Install Inno Setup
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.5
+        with:
+          path: packaging/windows/SyncRoom.iss
+
+      - name: Verify installer output
+        run: |
+          if (!(Test-Path "installer-dist/SyncRoom-Setup.exe")) { throw "installer-dist/SyncRoom-Setup.exe is missing" }
+          tree /F installer-dist
+
+      - name: Publish installer to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer-dist/SyncRoom-Setup.exe
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncroom-windows-build
+          if-no-files-found: error
+          path: |
+            installer-dist/SyncRoom-Setup.exe
+            dist/SyncRoom/**
