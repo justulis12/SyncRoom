@@ -763,7 +763,7 @@ class MainWindow(QMainWindow):
         return top_bar
 
     def make_scroll_page(self, widget: QWidget) -> QScrollArea:
-        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         scroll = QScrollArea()
         scroll.setObjectName("pageScrollArea")
         scroll.setWidgetResizable(True)
@@ -852,9 +852,9 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(0)
         self.join_page_layout = layout
-        self.join_shell_layout = QVBoxLayout()
+        self.join_shell_layout = QBoxLayout(QBoxLayout.LeftToRight)
         self.join_shell_layout.setContentsMargins(0, 0, 0, 0)
-        self.join_shell_layout.setSpacing(16)
+        self.join_shell_layout.setSpacing(18)
 
         card, card_layout = self.build_panel(
             "controlPanel",
@@ -865,7 +865,9 @@ class MainWindow(QMainWindow):
             blur=24,
             offset_y=10,
         )
-        card.setMaximumWidth(980)
+        card.setMinimumWidth(0)
+        card.setMaximumWidth(16777215)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.join_card = card
 
         eyebrow = QLabel("ACCESS")
@@ -903,6 +905,10 @@ class MainWindow(QMainWindow):
         self.name_input.setPlaceholderText("Name")
         self.name_input.returnPressed.connect(self.connect_to_room)
         self.host_select.currentIndexChanged.connect(self.on_host_mode_changed)
+        self.host_input.textChanged.connect(self.update_lobby_summary)
+        self.port_input.textChanged.connect(self.update_lobby_summary)
+        self.room_input.textChanged.connect(self.update_lobby_summary)
+        self.name_input.textChanged.connect(self.update_lobby_summary)
 
         self.join_host_profile_label = self.build_field_label("Server profile")
         self.join_host_label = self.build_field_label("Host or domain")
@@ -911,7 +917,6 @@ class MainWindow(QMainWindow):
         self.join_password_label = self.build_field_label("Room password")
         self.join_name_label = self.build_field_label("Display name")
         self.rebuild_join_grid(compact=False)
-        self.on_host_mode_changed()
 
         self.join_button_row = QBoxLayout(QBoxLayout.LeftToRight)
         self.join_button_row.setContentsMargins(0, 2, 0, 0)
@@ -920,7 +925,7 @@ class MainWindow(QMainWindow):
         self.connect_button.setObjectName("primaryButton")
         self.connect_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.connect_button.clicked.connect(self.connect_to_room)
-        self.join_button_row.addWidget(self.connect_button, 0, Qt.AlignHCenter)
+        self.join_button_row.addWidget(self.connect_button)
 
         card_layout.addWidget(eyebrow)
         card_layout.addWidget(title)
@@ -928,9 +933,48 @@ class MainWindow(QMainWindow):
         card_layout.addLayout(self.join_button_row)
         card_layout.addStretch(1)
 
-        self.join_shell_layout.addWidget(card, 0, Qt.AlignTop | Qt.AlignHCenter)
-        self.join_shell_layout.addStretch(1)
-        layout.addLayout(self.join_shell_layout)
+        side_content = QWidget()
+        side_content.setObjectName("sidebarCanvas")
+        side_content.setMinimumWidth(0)
+        side_content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        side_layout = QVBoxLayout(side_content)
+        side_layout.setContentsMargins(0, 0, 4, 0)
+        side_layout.setSpacing(14)
+        self.join_side_content = side_content
+        self.join_side_layout = side_layout
+
+        profile_card, profile_layout = self.build_panel(
+            "sidebarPanel",
+            margins=(20, 20, 20, 20),
+            spacing=12,
+            glow_color="#101010",
+            glow_alpha=105,
+            blur=26,
+            offset_y=10,
+        )
+        profile_overline = QLabel("LOBBY")
+        profile_overline.setObjectName("sectionOverline")
+        profile_title = QLabel("Connection")
+        profile_title.setObjectName("sectionTitle")
+        profile_title.setWordWrap(True)
+        profile_layout.addWidget(profile_overline)
+        profile_layout.addWidget(profile_title)
+
+        self.lobby_server_stat = self.build_stat_card("SERVER", "Hosted", "", "miniStatCard")
+        self.lobby_room_stat = self.build_stat_card("ROOM", "movie-night", "", "miniStatCard")
+        self.lobby_name_stat = self.build_stat_card("NAME", default_display_name(), "", "miniStatCard")
+        profile_layout.addWidget(self.lobby_server_stat)
+        profile_layout.addWidget(self.lobby_room_stat)
+        profile_layout.addWidget(self.lobby_name_stat)
+
+        side_layout.addWidget(profile_card)
+        side_layout.addStretch(1)
+
+        self.join_shell_layout.addWidget(card, 7)
+        self.join_shell_layout.addWidget(side_content, 3)
+        layout.addLayout(self.join_shell_layout, 1)
+        self.on_host_mode_changed()
+        self.update_lobby_summary()
         return page
 
     def build_room_page(self) -> QWidget:
@@ -1377,7 +1421,8 @@ class MainWindow(QMainWindow):
 
     def update_responsive_layouts(self) -> None:
         width = self.width()
-        compact_join = width < 940
+        join_stacked = width < 1040
+        compact_join = width < 860
         room_stacked = width < 1100
         room_compact = width < 850
 
@@ -1393,7 +1438,7 @@ class MainWindow(QMainWindow):
             room_margin = 6 if room_compact else 8
             self.room_page_layout.setContentsMargins(room_margin, room_margin, room_margin, room_margin)
         if hasattr(self, "join_card"):
-            self.join_card.setMaximumWidth(980 if width >= 1180 else 860 if width >= 920 else 16777215)
+            self.join_card.setMaximumWidth(16777215)
         if hasattr(self, "join_grid"):
             last_state = self.join_grid.property("compact")
             if last_state is None or bool(last_state) != compact_join:
@@ -1403,7 +1448,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, "top_bar_row"):
             self.top_bar_row.setSpacing(10 if room_compact else 12)
         if hasattr(self, "join_shell_layout"):
-            self.join_shell_layout.setSpacing(12 if room_compact else 16)
+            self.join_shell_layout.setDirection(QBoxLayout.TopToBottom if join_stacked else QBoxLayout.LeftToRight)
+            self.join_shell_layout.setSpacing(12 if room_compact else 14 if join_stacked else 18)
+        if hasattr(self, "join_side_content"):
+            self.join_side_content.setMinimumWidth(0)
+            self.join_side_content.setMaximumWidth(16777215 if join_stacked else 380)
         if hasattr(self, "room_shell_layout"):
             self.room_shell_layout.setDirection(QBoxLayout.TopToBottom if room_stacked else QBoxLayout.LeftToRight)
             self.room_shell_layout.setSpacing(12 if room_compact else 14 if room_stacked else 18)
@@ -1831,6 +1880,33 @@ class MainWindow(QMainWindow):
             return self.HOSTED_SERVER_URL
         return self.host_input.text().strip() or "127.0.0.1"
 
+    def update_lobby_summary(self) -> None:
+        if not hasattr(self, "lobby_server_stat"):
+            return
+        profile = "Hosted" if self.host_select.currentIndex() == 0 else "Custom"
+        host = self.selected_host()
+        port = self.port_input.text().strip() or "24873"
+        room = self.room_input.text().strip() or "movie-night"
+        name = self.name_input.text().strip() or default_display_name()
+        self.set_stat_card_text(
+            self.lobby_server_stat,
+            value=profile,
+            caption=f"{host}:{port}",
+            caption_elide_mode=Qt.ElideMiddle,
+        )
+        self.set_stat_card_text(
+            self.lobby_room_stat,
+            value=room,
+            caption="ready to join",
+            value_elide_mode=Qt.ElideMiddle,
+        )
+        self.set_stat_card_text(
+            self.lobby_name_stat,
+            value=name,
+            caption="display name",
+            value_elide_mode=Qt.ElideMiddle,
+        )
+
     def on_host_mode_changed(self) -> None:
         hosted = self.host_select.currentIndex() == 0
         self.host_input.setEnabled(not hosted)
@@ -1840,6 +1916,7 @@ class MainWindow(QMainWindow):
             if self.host_input.text().strip() == self.HOSTED_SERVER_URL:
                 custom_saved = str(self.settings.get("host", "127.0.0.1"))
                 self.host_input.setText(custom_saved if custom_saved != self.HOSTED_SERVER_URL else "127.0.0.1")
+        self.update_lobby_summary()
 
     def leave_room(self) -> None:
         self.sync_client.disconnect_from_server()
