@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
 import tempfile
 import time
 import urllib.error
@@ -18,6 +19,9 @@ LATEST_RELEASE_API = f"https://api.github.com/repos/{__repo__}/releases/latest"
 LATEST_RELEASE_PAGE = f"https://github.com/{__repo__}/releases/latest"
 ProgressCallback = Callable[[str, int], None]
 MAX_LOG_BYTES = 256 * 1024
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_BACKOFF_SECONDS = (1, 3, 6)
+RETRY_HTTP_STATUS_CODES = {429, 502, 503, 504}
 
 
 @dataclass
@@ -119,60 +123,131 @@ def download_update_asset(
     append_update_log(
         f"Starting installer download asset={info.asset_name} url={info.asset_url} temp_dir={temp_dir}"
     )
-    request = urllib.request.Request(info.asset_url, headers={"User-Agent": "SyncRoom"})
     _notify(progress, "Preparing update download...", 0)
+
+    last_error = ""
     try:
-        with urllib.request.urlopen(request, timeout=60) as response, partial_path.open("wb") as handle:
-            status_code = int(getattr(response, "status", 200) or 200)
-            if status_code >= 400:
-                raise RuntimeError(f"Update download returned HTTP {status_code}.")
-
-            total = int(response.headers.get("Content-Length") or "0")
-            downloaded = 0
-            while True:
-                chunk = response.read(1024 * 128)
-                if not chunk:
-                    break
-                handle.write(chunk)
-                downloaded += len(chunk)
-                if total > 0:
-                    ratio = min(downloaded / total, 1.0)
-                    _notify(progress, f"Downloading update... {int(ratio * 100)}%", int(ratio * 100))
-
-            if downloaded <= 0:
-                raise RuntimeError("The downloaded installer was empty.")
-            if total > 0 and downloaded != total:
-                raise RuntimeError(
-                    f"Downloaded size mismatch: expected {total} bytes, got {downloaded} bytes."
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            if partial_path.exists():
+                partial_path.unlink(missing_ok=True)
+            append_update_log(
+                "Installer download attempt "
+                f"attempt={attempt}/{DOWNLOAD_ATTEMPTS} url={info.asset_url} temp_path={partial_path}"
+            )
+            try:
+                downloaded = _download_update_once(
+                    info.asset_url,
+                    partial_path,
+                    progress,
+                    attempt,
                 )
-            if total <= 0:
-                _notify(progress, "Downloading update...", 100)
+                partial_size = partial_path.stat().st_size if partial_path.exists() else 0
+                append_update_log(
+                    "Installer download attempt completed "
+                    f"attempt={attempt}/{DOWNLOAD_ATTEMPTS} downloaded_bytes={downloaded} "
+                    f"temp_path={partial_path} size={partial_size}"
+                )
+                if partial_size <= 0:
+                    raise RuntimeError("The downloaded installer was empty.")
 
-        partial_size = partial_path.stat().st_size if partial_path.exists() else 0
-        if partial_size <= 0:
-            raise RuntimeError("The downloaded installer was empty.")
+                partial_path.replace(destination)
+                if not destination.exists() or destination.stat().st_size <= 0:
+                    raise RuntimeError("The downloaded installer was not saved correctly.")
+                append_update_log(
+                    f"Installer download completed path={destination} size={destination.stat().st_size}"
+                )
+                return destination
+            except Exception as exc:
+                last_error = _format_download_error(exc)
+                downloaded_bytes = partial_path.stat().st_size if partial_path.exists() else 0
+                append_update_log(
+                    "Installer download attempt failed "
+                    f"attempt={attempt}/{DOWNLOAD_ATTEMPTS} url={info.asset_url} "
+                    f"error={last_error} downloaded_bytes={downloaded_bytes} temp_path={partial_path}"
+                )
+                partial_path.unlink(missing_ok=True)
+                if attempt >= DOWNLOAD_ATTEMPTS or not _is_retryable_download_error(exc):
+                    break
+                delay = DOWNLOAD_BACKOFF_SECONDS[min(attempt - 1, len(DOWNLOAD_BACKOFF_SECONDS) - 1)]
+                _notify(progress, f"Download failed; retrying in {delay}s...", 0)
+                append_update_log(
+                    f"Retrying installer download after {delay}s attempt={attempt + 1}/{DOWNLOAD_ATTEMPTS}"
+                )
+                time.sleep(delay)
 
-        partial_path.replace(destination)
-        if not destination.exists() or destination.stat().st_size <= 0:
-            raise RuntimeError("The downloaded installer was not saved correctly.")
-        append_update_log(
-            f"Installer download completed path={destination} size={destination.stat().st_size}"
+        message = (
+            "Could not download the update installer after several attempts. "
+            "Please try again in a few minutes."
         )
-        return destination
-    except urllib.error.HTTPError as exc:
-        append_update_log(f"HTTP error during installer download: {exc.code} {exc.reason}")
-        raise RuntimeError(f"Could not download the update installer: HTTP {exc.code} {exc.reason}") from exc
-    except urllib.error.URLError as exc:
-        append_update_log(f"Network error during installer download: {exc.reason}")
-        raise RuntimeError(f"Could not download the update installer: {exc.reason}") from exc
-    except Exception as exc:
-        append_update_log(f"Installer download failed: {exc}")
-        raise
+        if last_error:
+            message = f"{message} Last error: {last_error}"
+        append_update_log(f"Installer download failed after retries: {last_error or '<unknown>'}")
+        raise RuntimeError(message)
     finally:
         if partial_path.exists():
             partial_path.unlink(missing_ok=True)
         if not destination.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _download_update_once(
+    url: str,
+    partial_path: Path,
+    progress: ProgressCallback | None,
+    attempt: int,
+) -> int:
+    request = urllib.request.Request(url, headers={"User-Agent": "SyncRoom"})
+    with urllib.request.urlopen(request, timeout=60) as response, partial_path.open("wb") as handle:
+        status_code = int(getattr(response, "status", 200) or 200)
+        append_update_log(f"Installer download response attempt={attempt} status={status_code}")
+        if status_code >= 400:
+            raise RuntimeError(f"Update download returned HTTP {status_code}.")
+
+        total = int(response.headers.get("Content-Length") or "0")
+        downloaded = 0
+        while True:
+            chunk = response.read(1024 * 128)
+            if not chunk:
+                break
+            handle.write(chunk)
+            downloaded += len(chunk)
+            if total > 0:
+                ratio = min(downloaded / total, 1.0)
+                _notify(progress, f"Downloading update... {int(ratio * 100)}%", int(ratio * 100))
+
+        append_update_log(
+            "Installer download stream ended "
+            f"attempt={attempt} status={status_code} downloaded_bytes={downloaded} "
+            f"expected_bytes={total} temp_path={partial_path}"
+        )
+        if downloaded <= 0:
+            raise RuntimeError("The downloaded installer was empty.")
+        if total > 0 and downloaded != total:
+            raise RuntimeError(
+                f"Downloaded size mismatch: expected {total} bytes, got {downloaded} bytes."
+            )
+        if total <= 0:
+            _notify(progress, "Downloading update...", 100)
+        return downloaded
+
+
+def _is_retryable_download_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return int(exc.code) in RETRY_HTTP_STATUS_CODES
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    message = str(exc).lower()
+    return "timed out" in message or "temporarily unavailable" in message
+
+
+def _format_download_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code} {exc.reason}"
+    if isinstance(exc, urllib.error.URLError):
+        return str(exc.reason)
+    return str(exc)
 
 
 def cleanup_update_download(path: Path | None) -> None:

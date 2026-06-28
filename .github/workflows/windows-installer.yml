@@ -33,10 +33,47 @@ jobs:
       - name: Build app bundle
         run: pyinstaller --clean --noconfirm packaging/syncroom.spec
 
+      - name: Verify app bundle
+        run: |
+          if (!(Test-Path "dist/SyncRoom/SyncRoom.exe")) { throw "dist/SyncRoom/SyncRoom.exe is missing" }
+          if (!(Test-Path "dist/SyncRoom/SyncRoomUpdate.exe")) { throw "dist/SyncRoom/SyncRoomUpdate.exe is missing" }
+          if (!(Test-Path "dist/SyncRoom/_internal")) { throw "dist/SyncRoom/_internal is missing" }
+          tree /F dist\SyncRoom
+
+      - name: Run updater self-test
+        id: updater_self_test
+        continue-on-error: true
+        run: dist/SyncRoom/SyncRoomUpdate.exe --self-test
+
+      - name: Collect updater self-test log on failure
+        if: steps.updater_self_test.outcome == 'failure'
+        run: |
+          $logPath = Join-Path $env:APPDATA "syncroom\logs\update-helper.log"
+          if (Test-Path $logPath) {
+            Copy-Item $logPath (Join-Path $env:RUNNER_TEMP "update-helper.log")
+          }
+
+      - name: Upload updater self-test log on failure
+        if: steps.updater_self_test.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-helper-log
+          if-no-files-found: warn
+          path: ${{ runner.temp }}\update-helper.log
+
+      - name: Fail after updater self-test failure
+        if: steps.updater_self_test.outcome == 'failure'
+        run: exit 1
+
       - name: Install Inno Setup
         uses: Minionguyjpro/Inno-Setup-Action@v1.2.5
         with:
           path: packaging/windows/SyncRoom.iss
+
+      - name: Verify installer output
+        run: |
+          if (!(Test-Path "installer-dist/SyncRoom-Setup.exe")) { throw "installer-dist/SyncRoom-Setup.exe is missing" }
+          tree /F installer-dist
 
       - name: Publish installer to GitHub release
         if: startsWith(github.ref, 'refs/tags/')

@@ -624,6 +624,7 @@ class MainWindow(QMainWindow):
         self.update_check_started = False
         self.update_prompted_version = ""
         self.update_installer_path: Path | None = None
+        self.update_in_progress = False
         self.last_applied_seek_token = 0
         self.last_applied_event_id = 0
         self.behind_sync_detected_at: float | None = None
@@ -2424,6 +2425,11 @@ class MainWindow(QMainWindow):
         return f"{minutes:02d}:{seconds:02d}"
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self.update_in_progress:
+            append_update_log("closeEvent accepted immediately during update handoff")
+            self.best_effort_update_shutdown()
+            event.accept()
+            return
         self.persist_settings()
         self.player.stop()
         self.shutdown_background_jobs()
@@ -2593,10 +2599,10 @@ class MainWindow(QMainWindow):
             self.show_update_error("SyncRoomUpdate.exe was not found next to the app.")
             return
         append_update_log(
-            f"Launching bundled updater updater={updater_path} installer={installer_path}"
+            f"updater launch requested updater={updater_path} installer={installer_path}"
         )
         try:
-            subprocess.Popen(
+            process = subprocess.Popen(
                 [
                     str(updater_path),
                     str(installer_path),
@@ -2612,9 +2618,49 @@ class MainWindow(QMainWindow):
             self.show_update_error(f"Could not launch the updater: {exc}")
             cleanup_update_download(installer_path)
             return
-        append_update_log("Bundled updater launch requested successfully")
+        append_update_log(f"updater process PID pid={process.pid}")
+        self.update_in_progress = True
+        append_update_log("update handoff flag set")
         self.show_status("Closing SyncRoom so the updater can finish the install...")
-        QTimer.singleShot(400, QApplication.instance().quit)
+        self.best_effort_update_shutdown()
+        self.hide()
+        append_update_log("main window hidden")
+        QTimer.singleShot(2500, self.force_update_handoff_exit)
+        app = QApplication.instance()
+        if app is not None:
+            append_update_log("QApplication.quit requested")
+            app.quit()
+
+    def best_effort_update_shutdown(self) -> None:
+        try:
+            self.persist_settings()
+        except Exception as exc:
+            append_update_log(f"best-effort settings save failed during update handoff: {exc}")
+        try:
+            if self.heartbeat.isActive():
+                self.heartbeat.stop()
+                append_update_log("heartbeat timer stopped during update handoff")
+        except Exception as exc:
+            append_update_log(f"heartbeat timer stop failed during update handoff: {exc}")
+        try:
+            self.sync_client.socket.abort()
+            append_update_log("network socket aborted during update handoff")
+        except Exception as exc:
+            append_update_log(f"network socket abort failed during update handoff: {exc}")
+        for thread in list(self._active_threads):
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    if not thread.wait(250):
+                        append_update_log("background worker still running during update handoff")
+            except Exception as exc:
+                append_update_log(f"background worker shutdown failed during update handoff: {exc}")
+
+    def force_update_handoff_exit(self) -> None:
+        if not self.update_in_progress:
+            return
+        append_update_log("fallback os._exit triggered during update handoff")
+        os._exit(0)
 
     def _track_background_job(self, thread: QThread, worker: QObject) -> None:
         self._active_threads.append(thread)
