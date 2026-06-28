@@ -1,5 +1,5 @@
 pkgname=syncroom
-pkgver=0.1.22
+pkgver=0.1.23
 pkgrel=1
 pkgdesc="Simple synced video room client and server"
 arch=('any')

@@ -27,6 +27,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller PySide6-Essentials shiboken6 setuptools wheel
 
+      - name: Check version sync
+        run: python scripts/check_version_sync.py
+
       - name: Build app bundle
         run: pyinstaller --clean --noconfirm packaging/syncroom.spec
 
@@ -41,13 +44,12 @@ jobs:
         with:
           files: |
             installer-dist/SyncRoom-Setup.exe
-            dist/SyncRoom/SyncRoomUpdate.exe
           generate_release_notes: true
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: syncroom-windows-installer
+          name: syncroom-windows-build
           path: |
             installer-dist/SyncRoom-Setup.exe
-            dist/SyncRoom/SyncRoomUpdate.exe
+            dist/SyncRoom/**

@@ -9,15 +9,18 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFontMetrics
 from PySide6.QtNetwork import QAbstractSocket, QTcpSocket
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QComboBox,
     QDialog,
     QFrame,
+    QGraphicsDropShadowEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -28,6 +31,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSizePolicy,
     QStackedWidget,
     QStyle,
     QTextEdit,
@@ -57,6 +61,8 @@ def append_update_log(message: str) -> None:
 
 _FAULT_LOG_HANDLE = None
 MAX_LOG_BYTES = 256 * 1024
+THREAD_SHUTDOWN_TIMEOUT_MS = 5000
+THREAD_FORCE_TERMINATE_TIMEOUT_MS = 2000
 
 
 def runtime_log_path() -> Path:
@@ -99,6 +105,40 @@ def append_runtime_log(message: str) -> None:
 
 def append_crash_log(message: str) -> None:
     _append_log(safe_logs_dir() / "crash.log", message)
+
+
+def qapplication_is_closing() -> bool:
+    app = QApplication.instance()
+    return app is None or app.closingDown()
+
+
+def dispose_qobject_safely(obj: QObject | None) -> None:
+    if obj is None:
+        return
+    if not qapplication_is_closing():
+        obj.deleteLater()
+
+
+def stop_thread_with_timeout(
+    thread: QThread,
+    log: Callable[[str], None],
+    context: str,
+    timeout_ms: int = THREAD_SHUTDOWN_TIMEOUT_MS,
+) -> bool:
+    if not thread.isRunning():
+        return True
+    thread.quit()
+    if thread.wait(timeout_ms):
+        return True
+
+    log(f"{context} thread did not stop within {timeout_ms}ms; forcing termination.")
+    thread.terminate()
+    if thread.wait(THREAD_FORCE_TERMINATE_TIMEOUT_MS):
+        log(f"{context} thread was force-terminated.")
+        return False
+
+    log(f"{context} thread could not be terminated cleanly.")
+    return False
 
 
 def configure_crash_logging() -> None:
@@ -328,36 +368,36 @@ class ProgressScreenDialog(QDialog):
         self.setStyleSheet(
             """
             QDialog {
-                background: #050508;
-                color: #f8f4ff;
+                background: #050505;
+                color: #f2f2f4;
                 font-family: "Noto Sans", "Cantarell", sans-serif;
             }
             QLabel#eyebrow {
-                color: #bfa3dd;
+                color: #b8b8bf;
                 font-size: 11px;
-                font-weight: 700;
-                letter-spacing: 0.16em;
+                font-weight: 800;
+                letter-spacing: 0.12em;
             }
             QLabel#title {
-                color: #fbf7ff;
+                color: #ffffff;
                 font-size: 28px;
                 font-weight: 800;
             }
             QLabel#subtitle, QLabel#setupStatus {
-                color: #d3c5e3;
+                color: #b9b9c0;
                 font-size: 14px;
             }
             QProgressBar {
                 min-height: 18px;
                 border-radius: 9px;
-                border: 1px solid #3d2e4c;
-                background: #120f18;
-                color: #f5effc;
+                border: 1px solid #525257;
+                background: #101011;
+                color: #f3f3f5;
                 text-align: center;
             }
             QProgressBar::chunk {
                 border-radius: 8px;
-                background: #8c58d6;
+                background: #f0f0f2;
             }
             """
         )
@@ -427,36 +467,36 @@ class UpdateProgressDialog(QDialog):
         self.setStyleSheet(
             """
             QDialog {
-                background: #050508;
-                color: #f8f4ff;
+                background: #050505;
+                color: #f2f2f4;
                 font-family: "Noto Sans", "Cantarell", sans-serif;
             }
             QLabel#eyebrow {
-                color: #bfa3dd;
+                color: #b8b8bf;
                 font-size: 11px;
-                font-weight: 700;
-                letter-spacing: 0.16em;
+                font-weight: 800;
+                letter-spacing: 0.12em;
             }
             QLabel#title {
-                color: #fbf7ff;
+                color: #ffffff;
                 font-size: 28px;
                 font-weight: 800;
             }
             QLabel#subtitle, QLabel#setupStatus {
-                color: #d3c5e3;
+                color: #b9b9c0;
                 font-size: 14px;
             }
             QProgressBar {
                 min-height: 18px;
                 border-radius: 9px;
-                border: 1px solid #3d2e4c;
-                background: #120f18;
-                color: #f5effc;
+                border: 1px solid #525257;
+                background: #101011;
+                color: #f3f3f5;
                 text-align: center;
             }
             QProgressBar::chunk {
                 border-radius: 8px;
-                background: #8c58d6;
+                background: #f0f0f2;
             }
             """
         )
@@ -479,25 +519,45 @@ def prepare_windows_runtime_if_needed() -> bool:
     thread = QThread()
     worker.moveToThread(thread)
     worker.progress.connect(dialog.set_progress)
-    worker.finished.connect(dialog.accept)
-    worker.finished.connect(thread.quit)
-    worker.failed.connect(thread.quit)
     thread.started.connect(worker.run)
 
-    failure_message = {"text": ""}
+    state = {
+        "failure_message": "",
+        "succeeded": False,
+    }
+
+    def remember_success() -> None:
+        state["succeeded"] = True
+        dialog.set_progress("Player installed.", 100)
+        append_runtime_log("Windows runtime installer worker finished successfully")
+        thread.quit()
+        dialog.accept()
 
     def remember_failure(message: str) -> None:
-        failure_message["text"] = message
+        state["failure_message"] = message
         dialog.set_progress(message, 0)
+        append_runtime_log(f"Windows runtime installer worker failed: {message}")
+        thread.quit()
         dialog.reject()
 
+    worker.finished.connect(remember_success)
     worker.failed.connect(remember_failure)
     thread.start()
     dialog.set_progress("Preparing setup...", 0)
     result = dialog.exec()
-    thread.wait()
-    worker.deleteLater()
-    thread.deleteLater()
+    stopped_cleanly = stop_thread_with_timeout(
+        thread,
+        append_runtime_log,
+        "Windows runtime installer",
+    )
+    if result == QDialog.Accepted and not stopped_cleanly:
+        state["failure_message"] = (
+            "SyncRoom finished setup, but the installer thread did not stop cleanly. "
+            f"See {runtime_log_path()} for details."
+        )
+        result = QDialog.Rejected
+    dispose_qobject_safely(worker)
+    dispose_qobject_safely(thread)
 
     if result == QDialog.Accepted:
         return True
@@ -505,7 +565,8 @@ def prepare_windows_runtime_if_needed() -> bool:
     QMessageBox.critical(
         None,
         "SyncRoom Setup",
-        failure_message["text"] or "SyncRoom could not install mpv automatically.",
+        state["failure_message"]
+        or f"SyncRoom could not install mpv automatically.\n\nSee {runtime_log_path()} for details.",
     )
     return False
 
@@ -526,7 +587,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("SyncRoom")
         self.resize(1100, 720)
-        self.setMinimumSize(860, 580)
+        self.setMinimumSize(720, 520)
         self.settings = load_settings()
 
         self.sync_client = SyncClient()
@@ -570,8 +631,9 @@ class MainWindow(QMainWindow):
         self._active_threads: list[QThread] = []
         self._active_workers: list[QObject] = []
 
+        self._last_ui_scale = -1.0
         self.build_ui()
-        self.apply_theme()
+        self.refresh_scaled_ui(force=True)
 
         self.heartbeat = QTimer(self)
         self.heartbeat.setInterval(350)
@@ -582,81 +644,241 @@ class MainWindow(QMainWindow):
 
     def build_ui(self) -> None:
         central = QWidget(self)
+        central.setObjectName("rootCanvas")
         root = QVBoxLayout(central)
-        root.setContentsMargins(18, 18, 18, 18)
-        root.setSpacing(12)
+        self.root_layout = root
 
+        dashboard_shell, dashboard_layout = self.build_panel(
+            "dashboardShell",
+            margins=(18, 18, 18, 18),
+            spacing=16,
+            glow_color="#090913",
+            glow_alpha=150,
+            blur=52,
+        )
+        dashboard_layout.addWidget(self.build_top_bar())
+
+        content_shell, content_layout = self.build_panel(
+            "contentShell",
+            margins=(12, 12, 12, 12),
+            spacing=0,
+            glow_color="#0d1020",
+            glow_alpha=120,
+            blur=42,
+        )
         self.page_stack = QStackedWidget()
-        self.page_stack.addWidget(self.build_join_page())
-        self.page_stack.addWidget(self.build_room_page())
+        self.page_stack.setObjectName("pageStack")
+        self.page_stack.addWidget(self.make_scroll_page(self.build_join_page()))
+        self.page_stack.addWidget(self.make_scroll_page(self.build_room_page()))
+        self.page_stack.currentChanged.connect(self.update_page_chrome)
 
-        root.addWidget(self.page_stack)
+        content_layout.addWidget(self.page_stack)
+        dashboard_layout.addWidget(content_shell, 1)
+        root.addWidget(dashboard_shell)
         self.setCentralWidget(central)
         self.statusBar().showMessage("Ready")
         self.refresh_audio_tracks()
+        self.update_page_chrome(self.page_stack.currentIndex())
+        QTimer.singleShot(0, self.update_responsive_layouts)
 
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(QApplication.instance().quit)
         self.addAction(quit_action)
 
+    def build_panel(
+        self,
+        object_name: str,
+        margins: tuple[int, int, int, int] = (24, 24, 24, 24),
+        spacing: int = 16,
+        glow_color: str = "#090b18",
+        glow_alpha: int = 125,
+        blur: int = 36,
+        offset_y: int = 14,
+    ) -> tuple[QFrame, QVBoxLayout]:
+        panel = QFrame()
+        panel.setObjectName(object_name)
+        panel.setFrameShape(QFrame.NoFrame)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(*margins)
+        layout.setSpacing(spacing)
+        self.apply_depth_effect(panel, glow_color, glow_alpha, blur, offset_y)
+        return panel, layout
+
+    def apply_depth_effect(
+        self,
+        widget: QWidget,
+        color: str,
+        alpha: int = 125,
+        blur: int = 36,
+        offset_y: int = 14,
+    ) -> None:
+        shadow = QGraphicsDropShadowEffect(widget)
+        glow = QColor(color)
+        glow.setAlpha(max(0, min(255, alpha)))
+        shadow.setColor(glow)
+        shadow.setBlurRadius(blur)
+        shadow.setOffset(0, offset_y)
+        widget.setGraphicsEffect(shadow)
+
+    def build_nav_chip(self, text: str) -> QLabel:
+        chip = QLabel(text)
+        chip.setObjectName("navChip")
+        chip.setProperty("active", False)
+        chip.setAlignment(Qt.AlignCenter)
+        return chip
+
+    def set_nav_chip_active(self, chip: QLabel, active: bool) -> None:
+        chip.setProperty("active", active)
+        chip.style().unpolish(chip)
+        chip.style().polish(chip)
+        chip.update()
+
+    def build_top_bar(self) -> QFrame:
+        top_bar, top_layout = self.build_panel(
+            "topBar",
+            margins=(10, 10, 10, 10),
+            spacing=0,
+            glow_color="#080911",
+            glow_alpha=70,
+            blur=20,
+            offset_y=6,
+        )
+
+        nav_capsule = QFrame()
+        nav_capsule.setObjectName("navCapsule")
+        nav_layout = QHBoxLayout(nav_capsule)
+        nav_layout.setContentsMargins(8, 8, 8, 8)
+        nav_layout.setSpacing(8)
+        self.lobby_nav_chip = self.build_nav_chip("Lobby")
+        self.room_nav_chip = self.build_nav_chip("Room")
+        for chip in (self.lobby_nav_chip, self.room_nav_chip):
+            nav_layout.addWidget(chip)
+
+        self.top_bar_row = QHBoxLayout()
+        self.top_bar_row.setContentsMargins(0, 0, 0, 0)
+        self.top_bar_row.addWidget(nav_capsule)
+        self.top_bar_row.addStretch(1)
+        top_layout.addLayout(self.top_bar_row)
+        return top_bar
+
+    def make_scroll_page(self, widget: QWidget) -> QScrollArea:
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        scroll = QScrollArea()
+        scroll.setObjectName("pageScrollArea")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(widget)
+        return scroll
+
+    def configure_resizable_label(
+        self,
+        label: QLabel,
+        *,
+        wrap: bool = True,
+        vertical_policy: QSizePolicy.Policy = QSizePolicy.Preferred,
+    ) -> None:
+        label.setMinimumWidth(0)
+        label.setWordWrap(wrap)
+        label.setSizePolicy(QSizePolicy.Expanding, vertical_policy)
+
+    def set_label_text_safe(
+        self,
+        label: QLabel,
+        full_text: str,
+        *,
+        elide_mode: Qt.TextElideMode | None = None,
+    ) -> None:
+        text = str(full_text or "")
+        label.setProperty("full_text", text)
+        label.setToolTip(text)
+        mode_value = None
+        if elide_mode is not None:
+            mode_value = elide_mode.value if hasattr(elide_mode, "value") else int(elide_mode)
+        label.setProperty("elide_mode", mode_value)
+        if elide_mode is None:
+            label.setText(text)
+            return
+        label.setWordWrap(False)
+        self.update_single_elided_label(label)
+
+    def update_single_elided_label(self, label: QLabel) -> None:
+        full_text = str(label.property("full_text") or "")
+        elide_value = label.property("elide_mode")
+        if elide_value is None:
+            if label.text() != full_text:
+                label.setText(full_text)
+            return
+        available_width = max(24, label.contentsRect().width())
+        metrics = QFontMetrics(label.font())
+        try:
+            mode = Qt.TextElideMode(int(elide_value))
+        except Exception:
+            mode = Qt.ElideRight
+        label.setText(metrics.elidedText(full_text, mode, available_width))
+        label.setToolTip(full_text if metrics.horizontalAdvance(full_text) > available_width else "")
+
+    def update_elided_labels(self) -> None:
+        for label in self.findChildren(QLabel):
+            if label.property("elide_mode") is not None:
+                self.update_single_elided_label(label)
+
+    def set_stat_card_text(
+        self,
+        card: QFrame,
+        *,
+        value: str | None = None,
+        caption: str | None = None,
+        value_elide_mode: Qt.TextElideMode = Qt.ElideRight,
+        caption_elide_mode: Qt.TextElideMode | None = None,
+    ) -> None:
+        if value is not None:
+            self.set_label_text_safe(card.value_label, value, elide_mode=value_elide_mode)  # type: ignore[attr-defined]
+        if caption is not None:
+            caption_text = str(caption)
+            card.caption_label.setVisible(bool(caption_text.strip()))  # type: ignore[attr-defined]
+            self.set_label_text_safe(  # type: ignore[attr-defined]
+                card.caption_label,
+                caption_text,
+                elide_mode=caption_elide_mode,
+            )
+
     def build_join_page(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("dashboardPage")
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(0)
+        self.join_page_layout = layout
+        self.join_shell_layout = QVBoxLayout()
+        self.join_shell_layout.setContentsMargins(0, 0, 0, 0)
+        self.join_shell_layout.setSpacing(16)
 
-        shell = QHBoxLayout()
-        shell.setSpacing(16)
+        card, card_layout = self.build_panel(
+            "controlPanel",
+            margins=(28, 28, 28, 28),
+            spacing=16,
+            glow_color="#040404",
+            glow_alpha=90,
+            blur=24,
+            offset_y=10,
+        )
+        card.setMaximumWidth(980)
+        self.join_card = card
 
-        intro_card = QFrame()
-        intro_card.setObjectName("heroCard")
-        intro_card.setMinimumWidth(360)
-        intro_layout = QVBoxLayout(intro_card)
-        intro_layout.setContentsMargins(28, 28, 28, 28)
-        intro_layout.setSpacing(14)
-
-        intro_eyebrow = QLabel("SYNCROOM")
-        intro_eyebrow.setObjectName("eyebrow")
-        intro_title = QLabel("Sync video with friends")
-        intro_title.setObjectName("title")
-        intro_title.setWordWrap(True)
-
-        intro_chip_row = QHBoxLayout()
-        intro_chip_row.setSpacing(10)
-        self.join_port_badge = QLabel("Default port 24873")
-        self.join_port_badge.setObjectName("softBadge")
-        self.join_player_badge = QLabel("mpv powered")
-        self.join_player_badge.setObjectName("softBadge")
-        intro_chip_row.addWidget(self.join_port_badge)
-        intro_chip_row.addWidget(self.join_player_badge)
-        intro_chip_row.addStretch(1)
-
-        stat_row = QHBoxLayout()
-        stat_row.setSpacing(10)
-        stat_row.addWidget(self.build_stat_card("PORT", "24873", "", "statCard"))
-        stat_row.addWidget(self.build_stat_card("PLAYER", "mpv", "", "statCard"))
-        stat_row.addWidget(self.build_stat_card("ROOM", "sync", "", "statCard"))
-
-        intro_layout.addWidget(intro_eyebrow)
-        intro_layout.addWidget(intro_title)
-        intro_layout.addLayout(intro_chip_row)
-        intro_layout.addLayout(stat_row)
-        intro_layout.addStretch(1)
-
-        card = QFrame()
-        card.setObjectName("joinShell")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(28, 28, 28, 28)
-        card_layout.setSpacing(16)
-
-        eyebrow = QLabel("JOIN")
+        eyebrow = QLabel("ACCESS")
         eyebrow.setObjectName("eyebrow")
-        title = QLabel("Connect")
+        title = QLabel("Join a room")
         title.setObjectName("title")
+        title.setWordWrap(True)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(10)
+        grid.setVerticalSpacing(12)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        self.join_grid = grid
 
         saved_host = self.settings.get("host", self.HOSTED_SERVER_URL)
         saved_host_mode = self.settings.get("host_mode", self.HOSTED_SERVER_LABEL)
@@ -681,76 +903,118 @@ class MainWindow(QMainWindow):
         self.name_input.returnPressed.connect(self.connect_to_room)
         self.host_select.currentIndexChanged.connect(self.on_host_mode_changed)
 
-        grid.addWidget(self.host_select, 0, 0, 1, 2)
-        grid.addWidget(self.host_input, 1, 0, 1, 2)
-        grid.addWidget(self.port_input, 2, 0)
-        grid.addWidget(self.room_input, 2, 1)
-        grid.addWidget(self.password_input, 3, 0, 1, 2)
-        grid.addWidget(self.name_input, 4, 0, 1, 2)
+        self.join_host_profile_label = self.build_field_label("Server profile")
+        self.join_host_label = self.build_field_label("Host or domain")
+        self.join_port_label = self.build_field_label("Port")
+        self.join_room_label = self.build_field_label("Room name")
+        self.join_password_label = self.build_field_label("Room password")
+        self.join_name_label = self.build_field_label("Display name")
+        self.rebuild_join_grid(compact=False)
         self.on_host_mode_changed()
 
-        button_row = QHBoxLayout()
-        button_row.setSpacing(10)
+        self.join_button_row = QBoxLayout(QBoxLayout.LeftToRight)
+        self.join_button_row.setContentsMargins(0, 2, 0, 0)
+        self.join_button_row.setSpacing(10)
         self.connect_button = QPushButton("Join Room")
         self.connect_button.setObjectName("primaryButton")
+        self.connect_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.connect_button.clicked.connect(self.connect_to_room)
-        button_row.addWidget(self.connect_button)
+        self.join_button_row.addWidget(self.connect_button, 0, Qt.AlignHCenter)
 
         card_layout.addWidget(eyebrow)
         card_layout.addWidget(title)
         card_layout.addLayout(grid)
-        card_layout.addLayout(button_row)
+        card_layout.addLayout(self.join_button_row)
         card_layout.addStretch(1)
 
-        shell.addWidget(intro_card, 5)
-        shell.addWidget(card, 4)
-        layout.addLayout(shell)
+        self.join_shell_layout.addWidget(card, 0, Qt.AlignTop | Qt.AlignHCenter)
+        self.join_shell_layout.addStretch(1)
+        layout.addLayout(self.join_shell_layout)
         return page
 
     def build_room_page(self) -> QWidget:
         page = QWidget()
-        layout = QHBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(20)
+        page.setObjectName("dashboardPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(0)
+        self.room_page_layout = layout
+
+        self.room_shell_layout = QBoxLayout(QBoxLayout.LeftToRight)
+        self.room_shell_layout.setContentsMargins(0, 0, 0, 0)
+        self.room_shell_layout.setSpacing(18)
 
         left_column = QVBoxLayout()
+        left_column.setContentsMargins(0, 0, 0, 0)
         left_column.setSpacing(18)
 
-        hero_card = QFrame()
-        hero_card.setObjectName("heroCard")
-        hero_layout = QVBoxLayout(hero_card)
-        hero_layout.setContentsMargins(24, 24, 24, 24)
-        hero_layout.setSpacing(12)
+        hero_card, hero_layout = self.build_panel(
+            "heroPanel",
+            margins=(26, 26, 26, 26),
+            spacing=14,
+            glow_color="#151127",
+            glow_alpha=150,
+            blur=44,
+            offset_y=18,
+        )
 
-        top_row = QHBoxLayout()
+        self.room_header_row = QBoxLayout(QBoxLayout.LeftToRight)
+        self.room_header_row.setContentsMargins(0, 0, 0, 0)
         title_box = QVBoxLayout()
         title_box.setSpacing(4)
+        room_eyebrow = QLabel("ROOM CONTROL")
+        room_eyebrow.setObjectName("eyebrow")
         room_title = QLabel("Room")
         room_title.setObjectName("roomTitle")
+        title_box.addWidget(room_eyebrow)
         title_box.addWidget(room_title)
 
-        badge_row = QHBoxLayout()
-        badge_row.setSpacing(10)
+        self.badge_row = QBoxLayout(QBoxLayout.LeftToRight)
+        self.badge_row.setContentsMargins(0, 0, 0, 0)
+        self.badge_row.setSpacing(10)
         self.connection_badge = QLabel("OFFLINE")
         self.connection_badge.setObjectName("offlineBadge")
+        self.connection_badge.setMinimumHeight(30)
+        self.configure_resizable_label(
+            self.connection_badge,
+            wrap=False,
+            vertical_policy=QSizePolicy.Fixed,
+        )
         self.room_badge = QLabel("Room: not connected")
         self.room_badge.setObjectName("softBadge")
+        self.room_badge.setMinimumHeight(30)
+        self.configure_resizable_label(
+            self.room_badge,
+            wrap=False,
+            vertical_policy=QSizePolicy.Fixed,
+        )
         self.members_badge = QLabel("0 viewers")
         self.members_badge.setObjectName("softBadge")
-        badge_row.addWidget(self.connection_badge)
-        badge_row.addWidget(self.room_badge)
-        badge_row.addWidget(self.members_badge)
-        badge_row.addStretch(1)
+        self.members_badge.setMinimumHeight(30)
+        self.configure_resizable_label(
+            self.members_badge,
+            wrap=False,
+            vertical_policy=QSizePolicy.Fixed,
+        )
+        self.set_label_text_safe(self.room_badge, "Room: not connected", elide_mode=Qt.ElideRight)
+        self.set_label_text_safe(self.members_badge, "0 viewers", elide_mode=Qt.ElideRight)
+        self.badge_row.addWidget(self.connection_badge)
+        self.badge_row.addWidget(self.room_badge)
+        self.badge_row.addWidget(self.members_badge)
+        self.badge_row.addStretch(1)
 
         self.leave_room_button = QPushButton("Leave Room")
         self.leave_room_button.setObjectName("ghostButton")
         self.leave_room_button.clicked.connect(self.leave_room)
+        self.leave_room_button.setMinimumHeight(42)
+        self.leave_room_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        top_row.addLayout(title_box, 1)
-        top_row.addWidget(self.leave_room_button)
+        self.room_header_row.addLayout(title_box, 1)
+        self.room_header_row.addWidget(self.leave_room_button)
 
-        stat_row = QHBoxLayout()
-        stat_row.setSpacing(10)
+        self.room_stat_row = QBoxLayout(QBoxLayout.LeftToRight)
+        self.room_stat_row.setContentsMargins(0, 0, 0, 0)
+        self.room_stat_row.setSpacing(12)
         self.room_status_card = self.build_stat_card(
             "STATUS", "Offline", "", "accentStatCard"
         )
@@ -760,34 +1024,84 @@ class MainWindow(QMainWindow):
         self.viewer_stat = self.build_stat_card(
             "VIEWERS", "0", "", "statCard"
         )
-        stat_row.addWidget(self.room_status_card)
-        stat_row.addWidget(self.room_name_stat)
-        stat_row.addWidget(self.viewer_stat)
+        self.room_stat_row.addWidget(self.room_status_card)
+        self.room_stat_row.addWidget(self.room_name_stat)
+        self.room_stat_row.addWidget(self.viewer_stat)
+        self.set_stat_card_text(
+            self.room_status_card,
+            value="Offline",
+            caption="room sync disconnected",
+        )
+        self.set_stat_card_text(
+            self.room_name_stat,
+            value="not connected",
+            caption="join a room to begin",
+            value_elide_mode=Qt.ElideMiddle,
+        )
+        self.set_stat_card_text(
+            self.viewer_stat,
+            value="0",
+            caption="connected room members",
+            caption_elide_mode=Qt.ElideRight,
+        )
 
-        hero_layout.addLayout(top_row)
-        hero_layout.addLayout(badge_row)
-        hero_layout.addLayout(stat_row)
+        hero_layout.addLayout(self.room_header_row)
+        hero_layout.addLayout(self.badge_row)
+        hero_layout.addLayout(self.room_stat_row)
 
-        stage_card = QFrame()
-        stage_card.setObjectName("stageCard")
-        stage_layout = QVBoxLayout(stage_card)
-        stage_layout.setContentsMargins(24, 24, 24, 24)
-        stage_layout.setSpacing(12)
+        stage_card, stage_layout = self.build_panel(
+            "stageCard",
+            margins=(24, 24, 24, 24),
+            spacing=16,
+            glow_color="#11131f",
+            glow_alpha=135,
+            blur=40,
+            offset_y=16,
+        )
+
+        stage_header = QHBoxLayout()
+        stage_header.setContentsMargins(0, 0, 0, 0)
+        stage_header.setSpacing(10)
+        stage_header_text = QVBoxLayout()
+        stage_header_text.setContentsMargins(0, 0, 0, 0)
+        stage_header_text.setSpacing(2)
+        stage_overline = QLabel("PLAYBACK")
+        stage_overline.setObjectName("sectionOverline")
+        stage_title = QLabel("Playback")
+        stage_title.setObjectName("sectionTitle")
+        stage_title.setWordWrap(True)
+        stage_header_text.addWidget(stage_overline)
+        stage_header_text.addWidget(stage_title)
+        stage_header.addLayout(stage_header_text, 1)
 
         self.player_hint = QLabel("mpv window")
         self.player_hint.setObjectName("playerHint")
         self.player_hint.setAlignment(Qt.AlignLeft)
         self.current_media_label = QLabel("No media loaded yet")
         self.current_media_label.setObjectName("mediaLabel")
-        self.current_media_label.setWordWrap(True)
+        self.configure_resizable_label(self.current_media_label, wrap=False)
+        self.current_media_label.setMinimumHeight(18)
+        self.set_label_text_safe(
+            self.current_media_label,
+            "No media loaded yet",
+            elide_mode=Qt.ElideMiddle,
+        )
 
         self.member_label = QLabel("Members: none")
         self.member_label.setObjectName("memberList")
-        self.member_label.setWordWrap(True)
+        self.configure_resizable_label(self.member_label, wrap=False)
+        self.member_label.setMinimumHeight(18)
+        self.set_label_text_safe(self.member_label, "Members: none", elide_mode=Qt.ElideRight)
 
-        media_surface = QFrame()
-        media_surface.setObjectName("mediaSurface")
-        media_surface_layout = QVBoxLayout(media_surface)
+        media_surface, media_surface_layout = self.build_panel(
+            "mediaSurface",
+            margins=(22, 22, 22, 22),
+            spacing=12,
+            glow_color="#0e1020",
+            glow_alpha=80,
+            blur=24,
+            offset_y=10,
+        )
         media_surface_layout.setContentsMargins(20, 20, 20, 20)
         media_surface_layout.setSpacing(10)
         media_surface_layout.addWidget(self.player_hint)
@@ -795,16 +1109,22 @@ class MainWindow(QMainWindow):
         media_surface_layout.addStretch(1)
         media_surface_layout.addWidget(self.member_label)
 
+        stage_layout.addLayout(stage_header)
         stage_layout.addWidget(media_surface, 1)
 
-        transport_card = QFrame()
-        transport_card.setObjectName("surfaceCard")
-        transport_layout = QVBoxLayout(transport_card)
-        transport_layout.setContentsMargins(18, 18, 18, 18)
-        transport_layout.setSpacing(10)
+        transport_card, transport_layout = self.build_panel(
+            "transportCard",
+            margins=(18, 18, 18, 18),
+            spacing=10,
+            glow_color="#101220",
+            glow_alpha=105,
+            blur=28,
+            offset_y=10,
+        )
 
-        transport_top = QHBoxLayout()
-        transport_top.setSpacing(12)
+        self.transport_top = QBoxLayout(QBoxLayout.LeftToRight)
+        self.transport_top.setContentsMargins(0, 0, 0, 0)
+        self.transport_top.setSpacing(12)
         self.play_button = QPushButton("Play")
         self.play_button.setObjectName("primaryButton")
         self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
@@ -818,118 +1138,181 @@ class MainWindow(QMainWindow):
         self.position_slider.sliderPressed.connect(self.on_slider_pressed)
         self.position_slider.sliderReleased.connect(self.on_slider_released)
 
-        transport_top.addWidget(self.play_button)
-        transport_top.addWidget(self.position_label)
-        transport_top.addWidget(self.position_slider, 1)
-        transport_top.addWidget(self.duration_label)
+        self.transport_top.addWidget(self.play_button)
+        self.transport_top.addWidget(self.position_label)
+        self.transport_top.addWidget(self.position_slider, 1)
+        self.transport_top.addWidget(self.duration_label)
 
-        transport_layout.addLayout(transport_top)
+        transport_layout.addLayout(self.transport_top)
 
         left_column.addWidget(hero_card)
         left_column.addWidget(stage_card, 1)
         left_column.addWidget(transport_card)
 
-        side_scroll = QScrollArea()
-        side_scroll.setObjectName("sideScroll")
-        side_scroll.setWidgetResizable(True)
-        side_scroll.setFrameShape(QFrame.NoFrame)
-        side_scroll.setMinimumWidth(360)
-        side_scroll.setMaximumWidth(400)
-
         side_content = QWidget()
+        side_content.setObjectName("sidebarCanvas")
         side_layout = QVBoxLayout(side_content)
         side_layout.setContentsMargins(0, 0, 4, 0)
-        side_layout.setSpacing(12)
+        side_layout.setSpacing(14)
+        self.room_side_content = side_content
+        self.room_side_layout = side_layout
+        side_content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        top_control_card = QFrame()
-        top_control_card.setObjectName("surfaceCard")
-        top_control_layout = QVBoxLayout(top_control_card)
-        top_control_layout.setContentsMargins(18, 18, 18, 18)
-        top_control_layout.setSpacing(10)
+        top_control_card, top_control_layout = self.build_panel(
+            "sidebarPanel",
+            margins=(20, 20, 20, 20),
+            spacing=12,
+            glow_color="#101220",
+            glow_alpha=110,
+            blur=28,
+            offset_y=10,
+        )
 
         side_title = QLabel("Stream")
         side_title.setObjectName("sectionTitle")
+        side_overline = QLabel("SOURCE")
+        side_overline.setObjectName("sectionOverline")
 
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("Video URL")
         self.url_input.returnPressed.connect(self.load_media_from_input)
 
+        top_control_layout.addWidget(side_overline)
         top_control_layout.addWidget(side_title)
         top_control_layout.addWidget(self.url_input)
 
-        load_row = QHBoxLayout()
-        load_row.setSpacing(10)
+        self.load_row = QBoxLayout(QBoxLayout.LeftToRight)
+        self.load_row.setContentsMargins(0, 0, 0, 0)
+        self.load_row.setSpacing(10)
         self.load_button = QPushButton("Load Link")
         self.load_button.setObjectName("primaryButton")
+        self.load_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.load_button.clicked.connect(self.load_media_from_input)
         self.sync_hint_button = QPushButton("Copy Room Name")
         self.sync_hint_button.setObjectName("ghostButton")
+        self.sync_hint_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.sync_hint_button.clicked.connect(self.copy_room_name_to_status)
-        load_row.addWidget(self.load_button)
-        load_row.addWidget(self.sync_hint_button)
-        top_control_layout.addLayout(load_row)
+        self.load_row.addWidget(self.load_button)
+        self.load_row.addWidget(self.sync_hint_button)
+        top_control_layout.addLayout(self.load_row)
 
-        audio_card = QFrame()
-        audio_card.setObjectName("surfaceCard")
-        audio_layout = QVBoxLayout(audio_card)
-        audio_layout.setContentsMargins(18, 18, 18, 18)
-        audio_layout.setSpacing(10)
+        stream_note = QLabel("Direct stream links only. Playback stays local on each machine.")
+        stream_note.setObjectName("inlineNote")
+        stream_note.setWordWrap(True)
+        top_control_layout.addWidget(stream_note)
+
+        audio_card, audio_layout = self.build_panel(
+            "sidebarPanel",
+            margins=(20, 20, 20, 20),
+            spacing=12,
+            glow_color="#101220",
+            glow_alpha=110,
+            blur=28,
+            offset_y=10,
+        )
 
         audio_title = QLabel("Audio")
         audio_title.setObjectName("sectionTitle")
+        audio_overline = QLabel("TRACKS")
+        audio_overline.setObjectName("sectionOverline")
 
         self.audio_pref_input = QLineEdit(self.settings.get("audio_preferences", "eng,en,english"))
         self.audio_pref_input.setPlaceholderText("Preferred audio")
 
+        audio_layout.addWidget(audio_overline)
         audio_layout.addWidget(audio_title)
         audio_layout.addWidget(self.audio_pref_input)
 
-        audio_pref_row = QHBoxLayout()
-        audio_pref_row.setSpacing(10)
+        self.audio_pref_row = QBoxLayout(QBoxLayout.LeftToRight)
+        self.audio_pref_row.setContentsMargins(0, 0, 0, 0)
+        self.audio_pref_row.setSpacing(10)
         self.prefer_english_button = QPushButton("English")
         self.prefer_english_button.setObjectName("pillButton")
+        self.prefer_english_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.prefer_english_button.clicked.connect(
             lambda: self.set_audio_preferences("eng,en,english")
         )
         self.prefer_japanese_button = QPushButton("Japanese")
         self.prefer_japanese_button.setObjectName("pillButton")
+        self.prefer_japanese_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.prefer_japanese_button.clicked.connect(
             lambda: self.set_audio_preferences("jp,jpn,japanese,jap")
         )
-        audio_pref_row.addWidget(self.prefer_english_button)
-        audio_pref_row.addWidget(self.prefer_japanese_button)
-        audio_layout.addLayout(audio_pref_row)
+        self.audio_pref_row.addWidget(self.prefer_english_button)
+        self.audio_pref_row.addWidget(self.prefer_japanese_button)
+        audio_layout.addLayout(self.audio_pref_row)
 
         self.audio_track_combo = QComboBox()
-        self.audio_track_combo.setMinimumWidth(280)
+        self.audio_track_combo.setMinimumWidth(0)
+        self.audio_track_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.audio_track_combo.setObjectName("elevatedCombo")
         audio_layout.addWidget(self.audio_track_combo)
 
-        audio_action_row = QHBoxLayout()
-        audio_action_row.setSpacing(10)
+        self.audio_action_row = QBoxLayout(QBoxLayout.LeftToRight)
+        self.audio_action_row.setContentsMargins(0, 0, 0, 0)
+        self.audio_action_row.setSpacing(10)
         self.refresh_audio_button = QPushButton("Refresh")
         self.refresh_audio_button.setObjectName("ghostButton")
+        self.refresh_audio_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.refresh_audio_button.clicked.connect(self.refresh_audio_tracks)
         self.use_audio_button = QPushButton("Use Selected")
+        self.use_audio_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.use_audio_button.clicked.connect(self.use_selected_audio_track)
-        audio_action_row.addWidget(self.refresh_audio_button)
-        audio_action_row.addWidget(self.use_audio_button)
-        audio_layout.addLayout(audio_action_row)
+        self.audio_action_row.addWidget(self.refresh_audio_button)
+        self.audio_action_row.addWidget(self.use_audio_button)
+        audio_layout.addLayout(self.audio_action_row)
 
         side_layout.addWidget(top_control_card)
         side_layout.addWidget(audio_card)
         side_layout.addStretch(1)
 
-        side_scroll.setWidget(side_content)
-
-        layout.addLayout(left_column, 1)
-        layout.addWidget(side_scroll)
+        self.room_shell_layout.addLayout(left_column, 7)
+        self.room_shell_layout.addWidget(side_content, 4)
+        layout.addLayout(self.room_shell_layout)
         return page
 
     def build_field_label(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setObjectName("fieldLabel")
+        label.setMinimumHeight(16)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         return label
+
+    def rebuild_join_grid(self, compact: bool) -> None:
+        while self.join_grid.count():
+            item = self.join_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+
+        if compact:
+            self.join_grid.addWidget(self.join_host_profile_label, 0, 0)
+            self.join_grid.addWidget(self.host_select, 1, 0)
+            self.join_grid.addWidget(self.join_host_label, 2, 0)
+            self.join_grid.addWidget(self.host_input, 3, 0)
+            self.join_grid.addWidget(self.join_port_label, 4, 0)
+            self.join_grid.addWidget(self.port_input, 5, 0)
+            self.join_grid.addWidget(self.join_room_label, 6, 0)
+            self.join_grid.addWidget(self.room_input, 7, 0)
+            self.join_grid.addWidget(self.join_password_label, 8, 0)
+            self.join_grid.addWidget(self.password_input, 9, 0)
+            self.join_grid.addWidget(self.join_name_label, 10, 0)
+            self.join_grid.addWidget(self.name_input, 11, 0)
+            return
+
+        self.join_grid.addWidget(self.join_host_profile_label, 0, 0, 1, 2)
+        self.join_grid.addWidget(self.host_select, 1, 0, 1, 2)
+        self.join_grid.addWidget(self.join_host_label, 2, 0, 1, 2)
+        self.join_grid.addWidget(self.host_input, 3, 0, 1, 2)
+        self.join_grid.addWidget(self.join_port_label, 4, 0)
+        self.join_grid.addWidget(self.join_room_label, 4, 1)
+        self.join_grid.addWidget(self.port_input, 5, 0)
+        self.join_grid.addWidget(self.room_input, 5, 1)
+        self.join_grid.addWidget(self.join_password_label, 6, 0, 1, 2)
+        self.join_grid.addWidget(self.password_input, 7, 0, 1, 2)
+        self.join_grid.addWidget(self.join_name_label, 8, 0, 1, 2)
+        self.join_grid.addWidget(self.name_input, 9, 0, 1, 2)
 
     def build_stat_card(
         self,
@@ -940,254 +1323,423 @@ class MainWindow(QMainWindow):
     ) -> QFrame:
         card = QFrame()
         card.setObjectName(object_name)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        card.setMinimumHeight(86 if object_name in {"statCard", "accentStatCard"} else 72)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(6)
 
         eyebrow_label = QLabel(eyebrow)
         eyebrow_label.setObjectName("statEyebrow")
         value_label = QLabel(value)
         value_label.setObjectName("statValue")
+        self.configure_resizable_label(value_label, wrap=False)
         caption_label = QLabel(caption)
         caption_label.setObjectName("statCaption")
-        caption_label.setWordWrap(True)
+        self.configure_resizable_label(caption_label, wrap=True)
+        caption_label.setVisible(bool(caption.strip()))
 
         layout.addWidget(eyebrow_label)
         layout.addWidget(value_label)
         layout.addWidget(caption_label)
         card.value_label = value_label  # type: ignore[attr-defined]
         card.caption_label = caption_label  # type: ignore[attr-defined]
+        if object_name == "accentStatCard":
+            self.apply_depth_effect(card, "#f1f1f4", 38, 24, 8)
+        elif object_name == "miniStatCard":
+            self.apply_depth_effect(card, "#0d1020", 70, 18, 6)
+        else:
+            self.apply_depth_effect(card, "#0c0f1b", 82, 22, 7)
         return card
 
-    def apply_theme(self) -> None:
-        self.setStyleSheet(
-            """
+    def update_page_chrome(self, index: int) -> None:
+        lobby_active = index == 0
+        room_active = index == 1
+        self.set_nav_chip_active(self.lobby_nav_chip, lobby_active)
+        self.set_nav_chip_active(self.room_nav_chip, room_active)
+
+    def compute_ui_scale(self) -> float:
+        width = max(self.width(), 1)
+        height = max(self.height(), 1)
+        if width < 820 or height < 580:
+            return 0.86
+        if width < 980 or height < 680:
+            return 0.93
+        return 1.0
+
+    def refresh_scaled_ui(self, force: bool = False) -> None:
+        scale = self.compute_ui_scale()
+        if force or self._last_ui_scale < 0 or abs(scale - self._last_ui_scale) > 0.001:
+            self._last_ui_scale = scale
+            self.apply_theme(scale)
+        self.update_responsive_layouts()
+
+    def update_responsive_layouts(self) -> None:
+        width = self.width()
+        compact_join = width < 940
+        room_stacked = width < 1100
+        room_compact = width < 850
+
+        outer_margin = 10 if room_compact else 12 if room_stacked else 14
+        outer_spacing = 10 if room_compact else 12
+        if hasattr(self, "root_layout"):
+            self.root_layout.setContentsMargins(outer_margin, outer_margin, outer_margin, 14)
+            self.root_layout.setSpacing(outer_spacing)
+        if hasattr(self, "join_page_layout"):
+            self.join_page_layout.setContentsMargins(6 if room_compact else 8, 6 if room_compact else 8, 6 if room_compact else 8, 8)
+            self.join_page_layout.setSpacing(10 if room_compact else 12)
+        if hasattr(self, "room_page_layout"):
+            room_margin = 6 if room_compact else 8
+            self.room_page_layout.setContentsMargins(room_margin, room_margin, room_margin, room_margin)
+        if hasattr(self, "join_card"):
+            self.join_card.setMaximumWidth(980 if width >= 1180 else 860 if width >= 920 else 16777215)
+        if hasattr(self, "join_grid"):
+            last_state = self.join_grid.property("compact")
+            if last_state is None or bool(last_state) != compact_join:
+                self.join_grid.setProperty("compact", compact_join)
+                self.rebuild_join_grid(compact_join)
+
+        if hasattr(self, "top_bar_row"):
+            self.top_bar_row.setSpacing(10 if room_compact else 12)
+        if hasattr(self, "join_shell_layout"):
+            self.join_shell_layout.setSpacing(12 if room_compact else 16)
+        if hasattr(self, "room_shell_layout"):
+            self.room_shell_layout.setDirection(QBoxLayout.TopToBottom if room_stacked else QBoxLayout.LeftToRight)
+            self.room_shell_layout.setSpacing(12 if room_compact else 14 if room_stacked else 18)
+        if hasattr(self, "room_header_row"):
+            self.room_header_row.setDirection(QBoxLayout.TopToBottom if width < 920 else QBoxLayout.LeftToRight)
+            self.room_header_row.setSpacing(10)
+        if hasattr(self, "badge_row"):
+            self.badge_row.setDirection(QBoxLayout.TopToBottom if width < 980 else QBoxLayout.LeftToRight)
+            self.badge_row.setSpacing(8 if room_compact else 10)
+        if hasattr(self, "room_stat_row"):
+            self.room_stat_row.setDirection(QBoxLayout.TopToBottom if width < 980 else QBoxLayout.LeftToRight)
+            self.room_stat_row.setSpacing(10)
+        if hasattr(self, "transport_top"):
+            self.transport_top.setDirection(QBoxLayout.TopToBottom if width < 900 else QBoxLayout.LeftToRight)
+            self.transport_top.setSpacing(10)
+        if hasattr(self, "load_row"):
+            self.load_row.setDirection(QBoxLayout.TopToBottom if width < 960 else QBoxLayout.LeftToRight)
+            self.load_row.setSpacing(10)
+        if hasattr(self, "audio_pref_row"):
+            self.audio_pref_row.setDirection(QBoxLayout.TopToBottom if width < 900 else QBoxLayout.LeftToRight)
+            self.audio_pref_row.setSpacing(10)
+        if hasattr(self, "audio_action_row"):
+            self.audio_action_row.setDirection(QBoxLayout.TopToBottom if width < 960 else QBoxLayout.LeftToRight)
+            self.audio_action_row.setSpacing(10)
+        if hasattr(self, "join_button_row"):
+            self.join_button_row.setDirection(QBoxLayout.TopToBottom if width < 760 else QBoxLayout.LeftToRight)
+            self.join_button_row.setSpacing(10)
+        if hasattr(self, "room_side_content"):
+            self.room_side_content.setMinimumWidth(0)
+            self.room_side_content.setMaximumWidth(16777215 if room_stacked else 420)
+        self.update_elided_labels()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self.refresh_scaled_ui()
+
+    def apply_theme(self, scale: float = 1.0) -> None:
+        title_px = max(24, round(28 * scale))
+        hero_px = max(25, round(30 * scale))
+        room_px = max(20, round(22 * scale))
+        section_px = max(15, round(17 * scale))
+        body_px = max(12, round(13 * scale))
+        note_px = max(11, round(12 * scale))
+        stat_px = max(17, round(19 * scale))
+        field_px = max(10, round(11 * scale))
+        control_h = max(38, round(42 * scale))
+        pill_h = max(36, round(42 * scale))
+        radius = max(14, round(18 * scale))
+        nav_h = max(32, round(36 * scale))
+        shell_radius = max(22, round(28 * scale))
+        content_radius = max(18, round(24 * scale))
+        panel_radius = max(18, round(24 * scale))
+        media_radius = max(16, round(20 * scale))
+        nav_radius = max(16, round(20 * scale))
+        card_radius = max(14, round(18 * scale))
+        mini_radius = max(12, round(16 * scale))
+        nav_pad = max(12, round(16 * scale))
+        nav_chip_radius = max(14, round(18 * scale))
+        badge_radius = max(12, round(15 * scale))
+        badge_vpad = max(5, round(7 * scale))
+        badge_hpad = max(10, round(12 * scale))
+        input_pad = max(10, round(14 * scale))
+        button_pad = max(14, round(18 * scale))
+        pill_radius = max(14, round(18 * scale))
+        slider_h = max(7, round(9 * scale))
+        slider_radius = max(4, round(5 * scale))
+        handle_w = max(16, round(18 * scale))
+        handle_radius = max(8, round(9 * scale))
+        combo_pad = max(28, round(32 * scale))
+        combo_dropdown_w = max(26, round(30 * scale))
+        menu_radius = max(12, round(14 * scale))
+        stylesheet = """
             QWidget {
-                background: #050714;
-                color: #eef1ff;
+                color: #f4f4f6;
                 font-family: "Noto Sans", "Cantarell", sans-serif;
-                font-size: 14px;
-            }
-            QMainWindow {
-                background: #050714;
-            }
-            QStackedWidget {
+                font-size: __BODY_PX__px;
                 background: transparent;
             }
-            QScrollArea, QScrollArea > QWidget > QWidget {
+            QMainWindow, QWidget#rootCanvas {
+                background: qradialgradient(
+                    cx: 0.14, cy: 0.08, radius: 1.2,
+                    fx: 0.14, fy: 0.08,
+                    stop: 0 rgba(28, 28, 32, 0.22),
+                    stop: 0.26 rgba(10, 10, 11, 0.92),
+                    stop: 1 rgba(0, 0, 0, 1.0)
+                );
+            }
+            QWidget#dashboardPage, QStackedWidget#pageStack, QWidget#sidebarCanvas {
                 background: transparent;
             }
-            QFrame#heroCard {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #12172a, stop:1 #17122a);
-                border: 1px solid #2c355a;
-                border-radius: 26px;
+            QScrollArea, QScrollArea > QWidget {
+                background: transparent;
+                border: 0;
             }
-            QFrame#joinShell {
-                background: #111728;
-                border: 1px solid #2b3554;
-                border-radius: 26px;
+            QFrame#dashboardShell {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(11, 11, 12, 0.99),
+                    stop:0.55 rgba(15, 15, 16, 0.97),
+                    stop:1 rgba(9, 9, 9, 0.99));
+                border: 1px solid rgba(84, 84, 88, 0.34);
+                border-radius: __SHELL_RADIUS__px;
             }
-            QFrame#surfaceCard {
-                background: #12192c;
-                border: 1px solid #2a3452;
-                border-radius: 22px;
+            QFrame#contentShell {
+                background: rgba(10, 10, 10, 0.38);
+                border: 1px solid rgba(58, 58, 62, 0.20);
+                border-radius: __CONTENT_RADIUS__px;
             }
-            QFrame#stageCard {
-                background: #0f1424;
-                border: 1px solid #242f4f;
-                border-radius: 26px;
+            QFrame#topBar, QFrame#heroPanel, QFrame#controlPanel, QFrame#stageCard, QFrame#transportCard, QFrame#sidebarPanel, QFrame#innerPanel {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(20, 20, 21, 0.94),
+                    stop:1 rgba(12, 12, 13, 0.86));
+                border: 1px solid rgba(72, 72, 76, 0.26);
+                border-radius: __PANEL_RADIUS__px;
             }
             QFrame#mediaSurface {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0a0f1d, stop:1 #11162a);
-                border: 1px solid #263151;
-                border-radius: 24px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(7, 7, 7, 0.98),
+                    stop:0.60 rgba(11, 11, 12, 0.94),
+                    stop:1 rgba(18, 18, 19, 0.92));
+                border: 1px solid rgba(58, 58, 62, 0.24);
+                border-radius: __MEDIA_RADIUS__px;
             }
-            QFrame#statCard, QFrame#accentStatCard {
-                background: #141b2f;
-                border: 1px solid #2d3758;
-                border-radius: 18px;
+            QFrame#navCapsule {
+                background: rgba(12, 12, 13, 0.96);
+                border: 1px solid rgba(70, 70, 74, 0.28);
+                border-radius: __NAV_RADIUS__px;
+            }
+            QFrame#statCard, QFrame#accentStatCard, QFrame#miniStatCard {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(18, 18, 19, 0.94),
+                    stop:1 rgba(11, 11, 12, 0.82));
+                border: 1px solid rgba(66, 66, 70, 0.24);
+                border-radius: __CARD_RADIUS__px;
             }
             QFrame#accentStatCard {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #171f3c, stop:1 #1d1b3d);
-                border: 1px solid #5466c9;
+                border: 1px solid rgba(98, 98, 104, 0.34);
             }
-            QLabel#eyebrow {
-                color: #8f98ff;
-                font-size: 11px;
+            QFrame#miniStatCard {
+                border-radius: __MINI_RADIUS__px;
+            }
+            QLabel#navChip {
+                min-height: __NAV_H__px;
+                padding: 0 __NAV_PAD__px;
+                border-radius: __NAV_CHIP_RADIUS__px;
+                color: rgba(214, 214, 216, 0.76);
+                background: transparent;
+                border: 1px solid transparent;
                 font-weight: 700;
-                letter-spacing: 0.16em;
+            }
+            QLabel#navChip[active="true"] {
+                color: #ffffff;
+                background: rgba(36, 36, 38, 0.96);
+                border: 1px solid rgba(118, 118, 122, 0.36);
+            }
+            QLabel#offlineBadge {
+                background: rgba(28, 28, 29, 0.94);
+                border: 1px solid rgba(90, 90, 94, 0.28);
+                color: #f0f0f2;
+                border-radius: __BADGE_RADIUS__px;
+                padding: __BADGE_VPAD__px __BADGE_HPAD__px;
+                font-weight: 700;
+            }
+            QLabel#onlineBadge {
+                background: rgba(30, 30, 32, 0.94);
+                border: 1px solid rgba(124, 124, 130, 0.30);
+                color: #f5f5f7;
+                border-radius: __BADGE_RADIUS__px;
+                padding: __BADGE_VPAD__px __BADGE_HPAD__px;
+                font-weight: 700;
+            }
+            QLabel#softBadge {
+                background: rgba(20, 20, 21, 0.94);
+                border: 1px solid rgba(78, 78, 82, 0.26);
+                color: #ededf0;
+                border-radius: __BADGE_RADIUS__px;
+                padding: __BADGE_VPAD__px __BADGE_HPAD__px;
+                font-weight: 700;
+            }
+            QLabel#eyebrow, QLabel#sectionOverline, QLabel#fieldLabel, QLabel#statEyebrow {
+                color: #b8b8bf;
+                font-size: __FIELD_PX__px;
+                font-weight: 800;
+                letter-spacing: 0.12em;
+                text-transform: uppercase;
             }
             QLabel#title {
-                font-size: 30px;
+                color: #ffffff;
+                font-size: __TITLE_PX__px;
                 font-weight: 800;
-                color: #eef3ff;
+            }
+            QLabel#heroTitle {
+                color: #ffffff;
+                font-size: __HERO_PX__px;
+                font-weight: 800;
             }
             QLabel#roomTitle {
-                font-size: 24px;
+                color: #ffffff;
+                font-size: __ROOM_PX__px;
                 font-weight: 800;
-                color: #eef3ff;
             }
             QLabel#sectionTitle {
-                font-size: 20px;
+                color: #fbfcff;
+                font-size: __SECTION_PX__px;
                 font-weight: 800;
-                color: #97a6ff;
             }
-            QLabel#subtitle, QLabel#miniText {
-                color: #b7c0e4;
+            QLabel#bodyText, QLabel#supportingText {
+                color: rgba(198, 198, 202, 0.84);
+                font-size: __BODY_PX__px;
             }
-            QLabel#featureText {
-                color: #d7dcf3;
-                font-size: 14px;
+            QLabel#inlineNote, QLabel#statCaption, QLabel#mediaLabel, QLabel#memberList {
+                color: rgba(168, 168, 174, 0.82);
+                font-size: __NOTE_PX__px;
             }
-            QLabel#fieldLabel {
-                color: #8e9bd1;
-                font-size: 12px;
-                font-weight: 700;
-                letter-spacing: 0.05em;
-                background: transparent;
-            }
-            QLabel#statEyebrow {
-                color: #8f9bc4;
-                font-size: 11px;
-                font-weight: 700;
-                letter-spacing: 0.12em;
+            QLabel#playerHint {
+                color: #ffffff;
+                font-size: __SECTION_PX__px;
+                font-weight: 800;
             }
             QLabel#statValue {
-                color: #eef3ff;
-                font-size: 21px;
+                color: #ffffff;
+                font-size: __STAT_PX__px;
                 font-weight: 800;
             }
             QLabel#statCaption {
-                color: #97a3cc;
-                font-size: 12px;
-            }
-            QLabel {
-                background: transparent;
-            }
-            QLabel#offlineBadge, QLabel#onlineBadge, QLabel#softBadge, QLabel#windowBadge, QLabel#mutedBadge {
-                border-radius: 14px;
-                padding: 8px 14px;
-                font-weight: 700;
-            }
-            QLabel#offlineBadge {
-                background: #321727;
-                border: 1px solid #723252;
-                color: #ffc1d8;
-            }
-            QLabel#onlineBadge {
-                background: #12261f;
-                border: 1px solid #1d9e65;
-                color: #b8ffd8;
-            }
-            QLabel#softBadge {
-                background: #121a2e;
-                border: 1px solid #323d61;
-                color: #d8deff;
-            }
-            QLabel#windowBadge {
-                background: #141b2f;
-                border: 1px solid #4f63c9;
-                color: #9aa7ff;
-            }
-            QLabel#mutedBadge {
-                background: #0d1222;
-                border: 1px solid #283250;
-                color: #aeb8de;
-            }
-            QLabel#playerHint {
-                color: #eef2ff;
-                font-size: 18px;
-                font-weight: 700;
-            }
-            QLabel#mediaLabel {
-                color: #aeb8de;
-                font-size: 13px;
-                padding: 0;
-            }
-            QLabel#memberList {
-                color: #9ea9d1;
-                font-size: 13px;
-                padding: 0;
-            }
-            QLineEdit, QPushButton, QComboBox {
-                min-height: 46px;
-                border-radius: 14px;
-                border: 1px solid #33405f;
-                background: #0d1222;
-                padding: 0 14px;
-                selection-background-color: #6a74ff;
-            }
-            QLineEdit:focus, QComboBox:focus {
-                border: 1px solid #8493ff;
-                background: #10172b;
-            }
-            QPushButton {
-                background: #7582f3;
-                color: #10142a;
-                font-weight: 700;
-                border: 0;
-            }
-            QPushButton:hover {
-                background: #8892ff;
-            }
-            QPushButton:pressed {
-                background: #626ed4;
-            }
-            QPushButton#primaryButton {
-                min-height: 48px;
-                padding: 0 20px;
-            }
-            QPushButton#ghostButton {
-                background: #12192c;
-                border: 1px solid #33405f;
-                color: #e6ecff;
-            }
-            QPushButton#ghostButton:hover {
-                background: #18213a;
-            }
-            QPushButton#pillButton {
-                background: #1a2240;
-                color: #cad2ff;
-                border: 1px solid #33405f;
-            }
-            QPushButton#pillButton:hover {
-                background: #202a50;
-            }
-            QTextEdit#helperPanel {
-                background: #0d1222;
-                border: 1px solid #24304f;
-                border-radius: 16px;
-                padding: 10px;
-                color: #d8def8;
-            }
-            QSlider::groove:horizontal {
-                height: 10px;
-                border-radius: 5px;
-                background: #141c31;
-            }
-            QSlider::sub-page:horizontal {
-                background: #7b88ff;
-                border-radius: 5px;
-            }
-            QSlider::handle:horizontal {
-                width: 18px;
-                margin: -6px 0;
-                border-radius: 9px;
-                background: #eef2ff;
-                border: 2px solid #7a86ff;
+                min-height: 0px;
             }
             QLabel#timeLabel {
-                color: #cfd6f7;
-                font-weight: 700;
+                color: #f7f7f8;
+                font-size: __NOTE_PX__px;
+                font-weight: 800;
                 min-width: 44px;
             }
+            QLineEdit, QComboBox {
+                min-width: 0px;
+                min-height: __CONTROL_H__px;
+                border-radius: __RADIUS__px;
+                border: 1px solid rgba(84, 84, 88, 0.28);
+                background: rgba(8, 8, 9, 0.96);
+                color: #ffffff;
+                padding: 0 __INPUT_PAD__px;
+                selection-background-color: rgba(160, 160, 168, 0.40);
+            }
+            QLineEdit:hover, QComboBox:hover {
+                border: 1px solid rgba(110, 110, 116, 0.40);
+                background: rgba(12, 12, 13, 0.98);
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid rgba(174, 174, 180, 0.54);
+                background: rgba(14, 14, 15, 0.98);
+                selection-background-color: rgba(160, 160, 168, 0.46);
+            }
+            QPushButton {
+                min-width: 0px;
+                min-height: __CONTROL_H__px;
+                border-radius: __RADIUS__px;
+                border: 1px solid rgba(86, 86, 90, 0.28);
+                padding: 0 __BUTTON_PAD__px;
+                font-weight: 800;
+                color: #fbfbff;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(17, 17, 18, 0.98),
+                    stop:1 rgba(10, 10, 10, 0.92));
+            }
+            QPushButton:hover {
+                border: 1px solid rgba(122, 122, 128, 0.40);
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(21, 21, 22, 0.98),
+                    stop:1 rgba(14, 14, 14, 0.94));
+            }
+            QPushButton:pressed {
+                padding-top: 1px;
+                background: rgba(9, 9, 10, 0.98);
+            }
+            QPushButton:focus {
+                border: 1px solid rgba(184, 184, 190, 0.62);
+            }
+            QPushButton#primaryButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(244, 244, 246, 0.94),
+                    stop:1 rgba(188, 188, 192, 0.92));
+                border: 1px solid rgba(224, 224, 228, 0.58);
+                color: #060606;
+            }
+            QPushButton#primaryButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(255, 255, 255, 0.98),
+                    stop:1 rgba(205, 205, 208, 0.96));
+            }
+            QPushButton#primaryButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(210, 210, 213, 0.96),
+                    stop:1 rgba(174, 174, 178, 0.94));
+            }
+            QPushButton#ghostButton, QPushButton#pillButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(16, 16, 17, 0.92),
+                    stop:1 rgba(11, 11, 11, 0.88));
+                border: 1px solid rgba(76, 76, 80, 0.26);
+                color: #f1f3ff;
+            }
+            QPushButton#ghostButton:hover, QPushButton#pillButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(20, 20, 21, 0.98),
+                    stop:1 rgba(14, 14, 14, 0.92));
+                border: 1px solid rgba(108, 108, 114, 0.34);
+            }
+            QPushButton#pillButton {
+                min-height: __PILL_H__px;
+                border-radius: __PILL_RADIUS__px;
+            }
+            QSlider::groove:horizontal {
+                height: __SLIDER_H__px;
+                border-radius: __SLIDER_RADIUS__px;
+                background: rgba(20, 20, 21, 0.98);
+            }
+            QSlider::sub-page:horizontal {
+                border-radius: __SLIDER_RADIUS__px;
+                background: rgba(230, 230, 234, 0.90);
+            }
+            QSlider::add-page:horizontal {
+                border-radius: __SLIDER_RADIUS__px;
+                background: rgba(32, 32, 34, 0.96);
+            }
+            QSlider::handle:horizontal {
+                width: __HANDLE_W__px;
+                margin: -6px 0;
+                border-radius: __HANDLE_RADIUS__px;
+                background: #f7f7f8;
+                border: 2px solid rgba(92, 92, 96, 0.90);
+            }
             QComboBox {
-                padding-right: 30px;
+                padding-right: __COMBO_PAD__px;
             }
             QComboBox::drop-down {
                 subcontrol-origin: padding;
                 subcontrol-position: top right;
-                width: 28px;
+                width: __COMBO_DROPDOWN_W__px;
                 border: 0;
                 background: transparent;
             }
@@ -1196,27 +1748,67 @@ class MainWindow(QMainWindow):
                 height: 0px;
                 border-left: 5px solid transparent;
                 border-right: 5px solid transparent;
-                border-top: 7px solid #9aa8ff;
-                margin-right: 10px;
+                border-top: 7px solid rgba(216, 216, 218, 0.92);
+                margin-right: 12px;
             }
             QComboBox QAbstractItemView {
-                background: #10162a;
-                border: 1px solid #354264;
-                selection-background-color: #7682f5;
-                selection-color: #111528;
-                color: #ebefff;
+                background: rgba(10, 10, 10, 0.99);
+                border: 1px solid rgba(92, 92, 96, 0.34);
+                border-radius: __MENU_RADIUS__px;
+                selection-background-color: rgba(78, 78, 82, 0.86);
+                selection-color: #ffffff;
+                color: #f5f7ff;
                 outline: 0;
-                padding: 4px;
+                padding: 6px;
+            }
+            QStatusBar {
+                background: rgba(4, 4, 4, 0.99);
+                color: rgba(210, 210, 214, 0.88);
+                border-top: 1px solid rgba(54, 54, 58, 0.20);
             }
             QStatusBar::item {
                 border: 0;
             }
-            QStatusBar {
-                background: #070b16;
-                color: #cfd7fb;
-            }
             """
-        )
+        replacements = {
+            "__BODY_PX__": str(body_px),
+            "__SHELL_RADIUS__": str(shell_radius),
+            "__CONTENT_RADIUS__": str(content_radius),
+            "__PANEL_RADIUS__": str(panel_radius),
+            "__MEDIA_RADIUS__": str(media_radius),
+            "__NAV_RADIUS__": str(nav_radius),
+            "__CARD_RADIUS__": str(card_radius),
+            "__MINI_RADIUS__": str(mini_radius),
+            "__NAV_H__": str(nav_h),
+            "__NAV_PAD__": str(nav_pad),
+            "__NAV_CHIP_RADIUS__": str(nav_chip_radius),
+            "__BADGE_RADIUS__": str(badge_radius),
+            "__BADGE_VPAD__": str(badge_vpad),
+            "__BADGE_HPAD__": str(badge_hpad),
+            "__FIELD_PX__": str(field_px),
+            "__TITLE_PX__": str(title_px),
+            "__HERO_PX__": str(hero_px),
+            "__ROOM_PX__": str(room_px),
+            "__SECTION_PX__": str(section_px),
+            "__NOTE_PX__": str(note_px),
+            "__STAT_PX__": str(stat_px),
+            "__CONTROL_H__": str(control_h),
+            "__RADIUS__": str(radius),
+            "__INPUT_PAD__": str(input_pad),
+            "__BUTTON_PAD__": str(button_pad),
+            "__PILL_H__": str(pill_h),
+            "__PILL_RADIUS__": str(pill_radius),
+            "__SLIDER_H__": str(slider_h),
+            "__SLIDER_RADIUS__": str(slider_radius),
+            "__HANDLE_W__": str(handle_w),
+            "__HANDLE_RADIUS__": str(handle_radius),
+            "__COMBO_PAD__": str(combo_pad),
+            "__COMBO_DROPDOWN_W__": str(combo_dropdown_w),
+            "__MENU_RADIUS__": str(menu_radius),
+        }
+        for token, value in replacements.items():
+            stylesheet = stylesheet.replace(token, value)
+        self.setStyleSheet(stylesheet)
 
     def connect_to_room(self) -> None:
         host = self.selected_host()
@@ -1269,7 +1861,11 @@ class MainWindow(QMainWindow):
 
     def set_media_url(self, media_url: str, broadcast: bool) -> None:
         self.current_media_url = media_url
-        self.current_media_label.setText(media_url)
+        self.set_label_text_safe(
+            self.current_media_label,
+            media_url or "No media loaded yet",
+            elide_mode=Qt.ElideMiddle,
+        )
         append_runtime_log(f"Loading media broadcast={broadcast}")
         try:
             self.suppress_sync = True
@@ -1446,8 +2042,7 @@ class MainWindow(QMainWindow):
             value = "Connected"
             caption = note or "connected to the room"
 
-        self.room_status_card.value_label.setText(value)  # type: ignore[attr-defined]
-        self.room_status_card.caption_label.setText(caption)  # type: ignore[attr-defined]
+        self.set_stat_card_text(self.room_status_card, value=value, caption=caption)
 
     def schedule_pending_room_sync(self, delay_ms: int | None = None) -> None:
         if self.pending_room_sync is None or self._pending_sync_retry_scheduled:
@@ -1638,13 +2233,23 @@ class MainWindow(QMainWindow):
     def on_room_state(self, payload: dict) -> None:
         members = payload.get("members") or []
         names = ", ".join(member.get("name", "guest") for member in members) or "none"
-        self.member_label.setText(f"Members: {names}")
-        self.current_member_count = len(members)
-        self.members_badge.setText(
-            f"{self.current_member_count} viewer{'s' if self.current_member_count != 1 else ''}"
+        self.set_label_text_safe(
+            self.member_label,
+            f"Members: {names}",
+            elide_mode=Qt.ElideRight,
         )
-        self.viewer_stat.value_label.setText(str(self.current_member_count))  # type: ignore[attr-defined]
-        self.viewer_stat.caption_label.setText(names)  # type: ignore[attr-defined]
+        self.current_member_count = len(members)
+        self.set_label_text_safe(
+            self.members_badge,
+            f"{self.current_member_count} viewer{'s' if self.current_member_count != 1 else ''}",
+            elide_mode=Qt.ElideRight,
+        )
+        self.set_stat_card_text(
+            self.viewer_stat,
+            value=str(self.current_member_count),
+            caption=names,
+            caption_elide_mode=Qt.ElideRight,
+        )
 
         media_url = str(payload.get("media_url") or "")
         position_ms = int(payload.get("position_ms") or 0)
@@ -1713,10 +2318,14 @@ class MainWindow(QMainWindow):
             self.player_seen_running_in_room = False
             self.clear_pending_room_sync()
             self.last_room_payload = None
-            self.members_badge.setText("0 viewers")
-            self.member_label.setText("Members: none")
-            self.viewer_stat.value_label.setText("0")  # type: ignore[attr-defined]
-            self.viewer_stat.caption_label.setText("connected room members")  # type: ignore[attr-defined]
+            self.set_label_text_safe(self.members_badge, "0 viewers", elide_mode=Qt.ElideRight)
+            self.set_label_text_safe(self.member_label, "Members: none", elide_mode=Qt.ElideRight)
+            self.set_stat_card_text(
+                self.viewer_stat,
+                value="0",
+                caption="connected room members",
+                caption_elide_mode=Qt.ElideRight,
+            )
             self.page_stack.setCurrentIndex(0)
             self.show_status("Disconnected")
 
@@ -1839,8 +2448,14 @@ class MainWindow(QMainWindow):
         self.update_check_started = False
         append_runtime_log(f"Automatic update check finished payload_type={type(payload).__name__}")
         if not isinstance(payload, UpdateInfo):
+            append_update_log(f"Unexpected update check payload type: {type(payload).__name__}")
             return
         self.pending_update_info = payload
+        append_update_log(
+            "Update check completed "
+            f"available={payload.available} latest={payload.latest_version or '<none>'} "
+            f"asset={payload.asset_name or '<none>'} message={payload.message or '<none>'}"
+        )
         if not payload.available:
             append_runtime_log("No update available")
             return
@@ -1851,7 +2466,8 @@ class MainWindow(QMainWindow):
         self.prompt_for_update(payload)
 
     def prompt_for_update(self, info: UpdateInfo) -> None:
-        if os.name == "nt" and info.asset_url:
+        packaged_windows_build = os.name == "nt" and getattr(sys, "frozen", False)
+        if packaged_windows_build and info.asset_url:
             result = QMessageBox.question(
                 self,
                 "SyncRoom Update",
@@ -1866,12 +2482,17 @@ class MainWindow(QMainWindow):
                 self.download_and_install_update(info)
             return
 
+        if os.name == "nt" and getattr(sys, "frozen", False) and not info.asset_url:
+            append_update_log(
+                f"Update available for {info.latest_version}, but no installer asset was found in the release."
+            )
+
         result = QMessageBox.information(
             self,
             "SyncRoom Update",
             (
                 f"SyncRoom {info.latest_version} is available.\n\n"
-                "Automatic in-app updating is currently only enabled for the Windows installer build. "
+                "Automatic in-app updating is currently only enabled for the packaged Windows installer build. "
                 "The release page will open now."
             ),
             QMessageBox.Ok | QMessageBox.Cancel,
@@ -1880,50 +2501,84 @@ class MainWindow(QMainWindow):
         if result == QMessageBox.Ok:
             QDesktopServices.openUrl(QUrl(info.download_url))
 
+    def show_update_error(self, message: str) -> None:
+        log_hint = f"See {update_log_path()} for details."
+        self.statusBar().showMessage(message, 5000)
+        QMessageBox.warning(self, "SyncRoom Update", f"{message}\n\n{log_hint}")
+
     def download_and_install_update(self, info: UpdateInfo) -> None:
+        append_update_log(
+            f"Starting update download latest_version={info.latest_version} asset={info.asset_name or '<none>'}"
+        )
         dialog = UpdateProgressDialog()
         worker = UpdateDownloadWorker(info)
         thread = QThread(self)
         self._track_background_job(thread, worker)
         worker.moveToThread(thread)
         worker.progress.connect(dialog.set_progress)
-        worker.finished.connect(dialog.accept)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
         thread.started.connect(worker.run)
 
-        failure_message = {"text": ""}
-        downloaded_path = {"path": ""}
+        state = {
+            "failure_message": "",
+            "downloaded_path": "",
+            "accepted": False,
+        }
 
         def remember_failure(message: str) -> None:
-            failure_message["text"] = message
+            state["failure_message"] = message
             dialog.set_progress(message, 0)
+            append_update_log(f"Update download failed: {message}")
+            thread.quit()
             dialog.reject()
 
         def remember_path(path: str) -> None:
-            downloaded_path["path"] = path
+            state["downloaded_path"] = path
+            state["accepted"] = True
             dialog.set_progress("Preparing installer...", 100)
+            append_update_log(f"Update downloaded successfully to {path}")
+            thread.quit()
+            dialog.accept()
 
         worker.failed.connect(remember_failure)
         worker.finished.connect(remember_path)
         thread.start()
         dialog.set_progress("Preparing update...", 0)
         result = dialog.exec()
-        thread.wait()
+        stopped_cleanly = stop_thread_with_timeout(
+            thread,
+            append_update_log,
+            "Update download",
+        )
         self._release_background_job(thread, worker)
+        if result == QDialog.Accepted and not stopped_cleanly:
+            state["failure_message"] = (
+                "The update downloaded, but the download worker did not stop cleanly."
+            )
+            result = QDialog.Rejected
 
         if result != QDialog.Accepted:
-            if downloaded_path["path"]:
-                cleanup_update_download(Path(downloaded_path["path"]))
-            self.show_error(failure_message["text"] or "SyncRoom could not download the update.")
+            if state["downloaded_path"]:
+                cleanup_update_download(Path(state["downloaded_path"]))
+            self.show_update_error(
+                state["failure_message"] or "SyncRoom could not download the update."
+            )
             return
 
-        self.update_installer_path = Path(downloaded_path["path"])
+        self.update_installer_path = Path(state["downloaded_path"])
         self.launch_update_installer_and_exit(self.update_installer_path)
 
     def launch_update_installer_and_exit(self, installer_path: Path) -> None:
         if os.name != "nt" or not getattr(sys, "frozen", False):
-            self.show_error("Automatic in-app updating is only available in the packaged Windows build.")
+            append_update_log("Automatic in-app updating requested outside packaged Windows build")
+            self.show_update_error(
+                "Automatic in-app updating is only available in the packaged Windows build."
+            )
+            return
+
+        if not installer_path.exists() or installer_path.stat().st_size <= 0:
+            append_update_log(f"Installer path invalid or empty: {installer_path}")
+            self.show_update_error("The downloaded installer is missing or empty.")
+            cleanup_update_download(installer_path)
             return
 
         app_path = Path(
@@ -1935,22 +2590,28 @@ class MainWindow(QMainWindow):
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
         if not updater_path.exists():
             append_update_log(f"Bundled updater missing at {updater_path}")
-            self.show_error("SyncRoomUpdate.exe was not found next to the app.")
+            self.show_update_error("SyncRoomUpdate.exe was not found next to the app.")
             return
         append_update_log(
             f"Launching bundled updater updater={updater_path} installer={installer_path}"
         )
-        subprocess.Popen(
-            [
-                str(updater_path),
-                str(installer_path),
-                str(app_path),
-                str(os.getpid()),
-            ],
-            creationflags=creationflags,
-            close_fds=True,
-            cwd=str(app_path.parent),
-        )
+        try:
+            subprocess.Popen(
+                [
+                    str(updater_path),
+                    str(installer_path),
+                    str(app_path),
+                    str(os.getpid()),
+                ],
+                creationflags=creationflags,
+                close_fds=True,
+                cwd=str(app_path.parent),
+            )
+        except Exception as exc:
+            append_update_log(f"Bundled updater launch failed: {exc}")
+            self.show_update_error(f"Could not launch the updater: {exc}")
+            cleanup_update_download(installer_path)
+            return
         append_update_log("Bundled updater launch requested successfully")
         self.show_status("Closing SyncRoom so the updater can finish the install...")
         QTimer.singleShot(400, QApplication.instance().quit)
@@ -1962,15 +2623,14 @@ class MainWindow(QMainWindow):
     def _release_background_job(self, thread: QThread, worker: QObject) -> None:
         if worker in self._active_workers:
             self._active_workers.remove(worker)
-            worker.deleteLater()
         if thread in self._active_threads:
             self._active_threads.remove(thread)
-            thread.deleteLater()
+        dispose_qobject_safely(worker)
+        dispose_qobject_safely(thread)
 
     def shutdown_background_jobs(self) -> None:
         for thread in list(self._active_threads):
-            thread.quit()
-            thread.wait(2000)
+            stop_thread_with_timeout(thread, append_runtime_log, "Background worker", 2000)
         self._active_threads.clear()
         self._active_workers.clear()
 
@@ -1993,11 +2653,17 @@ class MainWindow(QMainWindow):
         self.connection_badge.style().unpolish(self.connection_badge)
         self.connection_badge.style().polish(self.connection_badge)
         room_name = self.room_input.text().strip() or "not connected"
-        self.room_badge.setText(f"Room: {room_name if connected else 'not connected'}")
+        self.set_label_text_safe(
+            self.room_badge,
+            f"Room: {room_name if connected else 'not connected'}",
+            elide_mode=Qt.ElideRight,
+        )
         self.update_room_sync_state("connected" if connected else "idle")
-        self.room_name_stat.value_label.setText(room_name if connected else "not connected")  # type: ignore[attr-defined]
-        self.room_name_stat.caption_label.setText(  # type: ignore[attr-defined]
-            "share this room name with everyone" if connected else "join a room to begin"
+        self.set_stat_card_text(
+            self.room_name_stat,
+            value=room_name if connected else "not connected",
+            caption="share this room name with everyone" if connected else "join a room to begin",
+            value_elide_mode=Qt.ElideMiddle,
         )
 
 

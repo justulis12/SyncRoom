@@ -49,6 +49,9 @@ updater_pyz = PYZ(u.pure)
 updater = EXE(
     updater_pyz,
     u.scripts,
+    u.binaries,
+    u.datas,
+    [],
     name="SyncRoomUpdate",
     debug=False,
     bootloader_ignore_signals=False,
@@ -58,11 +61,9 @@ updater = EXE(
 )
 coll = COLLECT(
     exe,
-    updater,
     a.binaries,
-    u.binaries,
     a.datas,
-    u.datas,
+    updater,
     strip=False,
     upx=True,
     name="SyncRoom",

@@ -1,5 +1,6 @@
 #define MyAppName "SyncRoom"
-#define MyAppVersion "0.1.22"
+; Keep MyAppVersion in sync with pyproject.toml and src/syncroom/__init__.py.
+#define MyAppVersion "0.1.23"
 #define MyAppPublisher "justys"
 #define MyAppExeName "SyncRoom.exe"
 
