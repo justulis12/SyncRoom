@@ -1,6 +1,6 @@
 #define MyAppName "SyncRoom"
 ; Keep MyAppVersion in sync with pyproject.toml and src/syncroom/__init__.py.
-#define MyAppVersion "0.1.23"
+#define MyAppVersion "0.1.24"
 #define MyAppPublisher "justys"
 #define MyAppExeName "SyncRoom.exe"
 
@@ -12,7 +12,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-OutputDir=installer-dist
+OutputDir=..\..\installer-dist
 OutputBaseFilename=SyncRoom-Setup
 Compression=lzma
 SolidCompression=yes
