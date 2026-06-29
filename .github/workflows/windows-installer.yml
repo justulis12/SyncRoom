@@ -30,22 +30,58 @@ jobs:
       - name: Check version sync
         run: python scripts/check_version_sync.py
 
-      - name: Download Windows media runtime
-        run: python packaging/windows/download_mpv.py packaging/windows
-
       - name: Build app bundle
         run: pyinstaller --clean --noconfirm packaging/syncroom.spec
-
-      - name: Bundle media runtime
-        run: Copy-Item -Path "packaging/windows/runtime/*" -Destination "dist/SyncRoom" -Recurse -Force
 
       - name: Verify app bundle
         run: |
           if (!(Test-Path "dist/SyncRoom/SyncRoom.exe")) { throw "dist/SyncRoom/SyncRoom.exe is missing" }
           if (!(Test-Path "dist/SyncRoom/SyncRoomUpdate.exe")) { throw "dist/SyncRoom/SyncRoomUpdate.exe is missing" }
           if (!(Test-Path "dist/SyncRoom/_internal")) { throw "dist/SyncRoom/_internal is missing" }
-          if (!(Test-Path "dist/SyncRoom/mpv.exe")) { throw "dist/SyncRoom/mpv.exe is missing" }
-          if (!(Test-Path "dist/SyncRoom/yt-dlp.exe")) { throw "dist/SyncRoom/yt-dlp.exe is missing" }
+          $forbiddenPaths = @(
+            "dist/SyncRoom/mpv.exe",
+            "dist/SyncRoom/mpv.com",
+            "dist/SyncRoom/yt-dlp.exe",
+            "dist/SyncRoom/mpv",
+            "dist/SyncRoom/runtime",
+            "dist/SyncRoom/portable_config"
+          )
+          foreach ($path in $forbiddenPaths) {
+            if (Test-Path $path) { throw "Bundled media runtime file/folder must not exist: $path" }
+          }
+          $forbiddenDllPatterns = @(
+            "avcodec*.dll",
+            "avdevice*.dll",
+            "avfilter*.dll",
+            "avformat*.dll",
+            "avutil*.dll",
+            "d3dcompiler_*.dll",
+            "libass*.dll",
+            "libbluray*.dll",
+            "libdav1d*.dll",
+            "libmpv*.dll",
+            "libplacebo*.dll",
+            "libshaderc*.dll",
+            "lua*.dll",
+            "shaderc_shared.dll",
+            "swresample*.dll",
+            "swscale*.dll",
+            "uchardet*.dll",
+            "vulkan*.dll",
+            "zimg*.dll"
+          )
+          foreach ($pattern in $forbiddenDllPatterns) {
+            $runtimeDlls = Get-ChildItem -Path "dist/SyncRoom" -Filter $pattern -File -ErrorAction SilentlyContinue
+            if ($runtimeDlls) {
+              $names = ($runtimeDlls | ForEach-Object { $_.FullName }) -join ", "
+              throw "Root-level mpv runtime DLLs must not be bundled: $names"
+            }
+          }
+          Write-Host "Largest files in dist/SyncRoom:"
+          Get-ChildItem -Path "dist/SyncRoom" -Recurse -File |
+            Sort-Object Length -Descending |
+            Select-Object -First 20 @{Name="SizeMB";Expression={[math]::Round($_.Length / 1MB, 2)}}, FullName |
+            Format-Table -AutoSize
           tree /F dist\SyncRoom
 
       - name: Run updater self-test
@@ -81,6 +117,13 @@ jobs:
       - name: Verify installer output
         run: |
           if (!(Test-Path "installer-dist/SyncRoom-Setup.exe")) { throw "installer-dist/SyncRoom-Setup.exe is missing" }
+          $installer = Get-Item "installer-dist/SyncRoom-Setup.exe"
+          Write-Host ("Final installer size: {0} MB" -f [math]::Round($installer.Length / 1MB, 2))
+          Write-Host "Largest files in dist/SyncRoom:"
+          Get-ChildItem -Path "dist/SyncRoom" -Recurse -File |
+            Sort-Object Length -Descending |
+            Select-Object -First 20 @{Name="SizeMB";Expression={[math]::Round($_.Length / 1MB, 2)}}, FullName |
+            Format-Table -AutoSize
           tree /F installer-dist
 
       - name: Publish installer to GitHub release

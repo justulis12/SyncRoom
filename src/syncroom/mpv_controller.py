@@ -38,16 +38,7 @@ class MpvController:
     def _resolve_mpv_path(self) -> str:
         candidates: list[Path] = []
         if os.name == "nt":
-            exe_dir = Path(sys.executable).resolve().parent
             candidates.append(windows_runtime_mpv_path())
-            candidates.extend(
-                [
-                    exe_dir / "mpv.exe",
-                    exe_dir / "mpv" / "mpv.exe",
-                ]
-            )
-            for found in exe_dir.rglob("mpv.exe"):
-                candidates.append(found)
         else:
             candidates.extend(
                 [
@@ -67,21 +58,23 @@ class MpvController:
         candidates: list[Path] = []
         exe_dir = Path(sys.executable).resolve().parent
         mpv_path = Path(self.mpv_path)
+        discovered = shutil.which("yt-dlp")
+        if discovered:
+            return discovered
         candidates.append(exe_dir / "yt-dlp.exe")
         candidates.append(exe_dir / "yt-dlp")
+        if os.name == "nt":
+            candidates.append(windows_runtime_mpv_path().parent / "yt-dlp.exe")
         if mpv_path.parent:
             candidates.append(mpv_path.parent / "yt-dlp.exe")
             candidates.append(mpv_path.parent / "yt-dlp")
             candidates.append(mpv_path.parent / "runtime" / "yt-dlp.exe")
-        if os.name == "nt":
-            candidates.append(windows_runtime_mpv_path().parent / "yt-dlp.exe")
 
         for candidate in candidates:
             if candidate.exists():
                 return str(candidate)
 
-        discovered = shutil.which("yt-dlp")
-        return discovered or ""
+        return ""
 
     def yt_dlp_available(self) -> bool:
         return bool(self.yt_dlp_path())
