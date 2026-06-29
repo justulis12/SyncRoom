@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from syncroom.windows_runtime import (
-    ensure_windows_mpv_runtime,
+    ensure_windows_media_runtime,
     windows_mpv_available,
     windows_runtime_mpv_path,
+    windows_runtime_yt_dlp_path,
+    windows_yt_dlp_available,
 )
 
 
@@ -57,24 +59,22 @@ class MpvController:
     def yt_dlp_path(self) -> str:
         candidates: list[Path] = []
         exe_dir = Path(sys.executable).resolve().parent
-        mpv_path = Path(self.mpv_path)
         discovered = shutil.which("yt-dlp")
         if discovered:
             return discovered
+        if os.name == "nt":
+            candidates.append(windows_runtime_yt_dlp_path())
         candidates.append(exe_dir / "yt-dlp.exe")
         candidates.append(exe_dir / "yt-dlp")
-        if os.name == "nt":
-            candidates.append(windows_runtime_mpv_path().parent / "yt-dlp.exe")
-        if mpv_path.parent:
-            candidates.append(mpv_path.parent / "yt-dlp.exe")
-            candidates.append(mpv_path.parent / "yt-dlp")
-            candidates.append(mpv_path.parent / "runtime" / "yt-dlp.exe")
 
         for candidate in candidates:
             if candidate.exists():
                 return str(candidate)
 
         return ""
+
+    def mpv_available(self) -> bool:
+        return self._mpv_command_exists()
 
     def yt_dlp_available(self) -> bool:
         return bool(self.yt_dlp_path())
@@ -382,10 +382,20 @@ class MpvController:
         if self._attempted_runtime_install:
             return
         self._attempted_runtime_install = True
-        self.mpv_path = str(ensure_windows_mpv_runtime())
+        result = ensure_windows_media_runtime()
+        self.mpv_path = str(result.mpv_path)
+
+    def needs_windows_mpv_runtime_install(self) -> bool:
+        return os.name == "nt" and not windows_mpv_available()
+
+    def needs_windows_yt_dlp_runtime_install(self) -> bool:
+        return os.name == "nt" and not windows_yt_dlp_available() and not self.yt_dlp_available()
+
+    def needs_windows_media_runtime_install(self) -> bool:
+        return self.needs_windows_mpv_runtime_install() or self.needs_windows_yt_dlp_runtime_install()
 
     def needs_windows_runtime_install(self) -> bool:
-        return os.name == "nt" and not self._mpv_command_exists() and not windows_mpv_available()
+        return self.needs_windows_media_runtime_install()
 
     @staticmethod
     def _readline_from_socket(client: socket.socket) -> bytes:

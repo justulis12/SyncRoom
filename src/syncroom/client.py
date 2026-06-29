@@ -53,7 +53,13 @@ from syncroom.utils.logging import (
     safe_logs_dir,
     update_log_path,
 )
-from syncroom.windows_runtime import ensure_windows_mpv_runtime
+from syncroom.windows_runtime import (
+    ensure_windows_media_runtime,
+    windows_mpv_available,
+    windows_runtime_mpv_path,
+    windows_runtime_yt_dlp_path,
+    windows_yt_dlp_available,
+)
 
 
 THREAD_SHUTDOWN_TIMEOUT_MS = 5000
@@ -96,16 +102,16 @@ def stop_thread_with_timeout(
 
 class WindowsRuntimeInstallerWorker(QObject):
     progress = Signal(str, int)
-    finished = Signal()
+    finished = Signal(object)
     failed = Signal(str)
 
     def run(self) -> None:
         try:
-            ensure_windows_mpv_runtime(self._report)
+            result = ensure_windows_media_runtime(self._report)
         except Exception as exc:
             self.failed.emit(str(exc))
             return
-        self.finished.emit()
+        self.finished.emit(result)
 
     def _report(self, message: str, percent: int) -> None:
         self.progress.emit(message, percent)
@@ -123,7 +129,7 @@ def prepare_windows_runtime_if_needed() -> bool:
         return True
 
     probe = MpvController()
-    if not probe.needs_windows_runtime_install():
+    if not probe.needs_windows_media_runtime_install():
         return True
 
     dialog = StartupSetupDialog()
@@ -135,43 +141,64 @@ def prepare_windows_runtime_if_needed() -> bool:
 
     state = {
         "failure_message": "",
-        "succeeded": False,
+        "yt_dlp_error": "",
+        "mpv_succeeded": False,
+        "timed_out": False,
     }
 
-    def remember_success() -> None:
-        state["succeeded"] = True
-        dialog.set_progress("Player installed.", 100)
+    def remember_success(result: object) -> None:
+        state["mpv_succeeded"] = True
+        state["yt_dlp_error"] = str(getattr(result, "yt_dlp_error", "") or "")
+        dialog.set_progress("Media tools installed.", 100)
         append_runtime_log("Windows runtime installer worker finished successfully")
         thread.quit()
-        dialog.accept()
 
     def remember_failure(message: str) -> None:
         state["failure_message"] = message
         dialog.set_progress(message, 0)
         append_runtime_log(f"Windows runtime installer worker failed: {message}")
         thread.quit()
-        dialog.reject()
+
+    def close_dialog_after_thread_finished() -> None:
+        accepted = bool(state["mpv_succeeded"])
+        QTimer.singleShot(0, dialog.accept if accepted else dialog.reject)
+
+    def abort_setup_after_timeout() -> None:
+        if not thread.isRunning():
+            return
+        state["timed_out"] = True
+        state["failure_message"] = (
+            "SyncRoom setup timed out while preparing media tools. "
+            f"See {runtime_log_path()} for details."
+        )
+        append_runtime_log("Windows runtime installer timed out; terminating worker thread")
+        thread.terminate()
+        thread.wait(THREAD_FORCE_TERMINATE_TIMEOUT_MS)
+        QTimer.singleShot(0, dialog.reject)
 
     worker.finished.connect(remember_success)
     worker.failed.connect(remember_failure)
+    thread.finished.connect(close_dialog_after_thread_finished)
+    thread.finished.connect(worker.deleteLater)
     thread.start()
     dialog.set_progress("Preparing setup...", 0)
+    QTimer.singleShot(10 * 60 * 1000, abort_setup_after_timeout)
     result = dialog.exec()
-    stopped_cleanly = stop_thread_with_timeout(
-        thread,
-        append_runtime_log,
-        "Windows runtime installer",
-    )
-    if result == QDialog.Accepted and not stopped_cleanly:
-        state["failure_message"] = (
-            "SyncRoom finished setup, but the installer thread did not stop cleanly. "
-            f"See {runtime_log_path()} for details."
-        )
-        result = QDialog.Rejected
-    dispose_qobject_safely(worker)
+    if thread.isRunning():
+        stop_thread_with_timeout(thread, append_runtime_log, "Windows runtime installer")
     dispose_qobject_safely(thread)
 
     if result == QDialog.Accepted:
+        if state["yt_dlp_error"]:
+            QMessageBox.warning(
+                None,
+                "SyncRoom Setup",
+                (
+                    "SyncRoom installed mpv, but could not install yt-dlp. "
+                    "Direct video links still work, but online media links may not.\n\n"
+                    f"Details: {state['yt_dlp_error']}"
+                ),
+            )
         return True
 
     QMessageBox.critical(
@@ -243,6 +270,8 @@ class MainWindow(QMainWindow):
         self.last_applied_event_id = 0
         self.last_osd_event_id = 0
         self.last_osd_signature = ""
+        self.last_local_osd_signature = ""
+        self.last_local_osd_at = 0.0
         self.show_playback_osd = True
         self.behind_sync_detected_at: float | None = None
         self.player_seen_running_in_room = False
@@ -1836,7 +1865,7 @@ class MainWindow(QMainWindow):
         append_runtime_log(f"Loading media broadcast={broadcast}")
         try:
             self.suppress_sync = True
-            if os.name == "nt" and self.player.needs_windows_runtime_install():
+            if os.name == "nt" and self.player.needs_windows_mpv_runtime_install():
                 self.show_status("First-time setup: downloading mpv for Windows...")
             self.player.load(media_url)
             self.position_slider.setRange(0, 0)
@@ -1854,6 +1883,8 @@ class MainWindow(QMainWindow):
             self.pending_audio_attempts = 10
             self.pending_subtitle_attempts = 10
             self.show_status("Loaded video link in mpv")
+            if broadcast:
+                self.show_local_playback_osd("load", 0)
             QTimer.singleShot(250, self.refresh_audio_tracks)
             QTimer.singleShot(450, self.apply_audio_preferences_with_retry)
             QTimer.singleShot(300, self.refresh_subtitle_tracks)
@@ -2085,6 +2116,10 @@ class MainWindow(QMainWindow):
                     target_playing,
                     reason="play" if target_playing else "pause",
                 )
+                self.show_local_playback_osd(
+                    "play" if target_playing else "pause",
+                    int(status["position_ms"]),
+                )
             self.last_known_playing = target_playing
         except Exception as exc:
             self.show_error(f"Could not control mpv: {exc}")
@@ -2112,6 +2147,7 @@ class MainWindow(QMainWindow):
                     force_seek=True,
                     reason="seek",
                 )
+                self.show_local_playback_osd("seek", target_position)
             except Exception as exc:
                 self.show_error(f"Could not seek in mpv: {exc}")
 
@@ -2193,6 +2229,7 @@ class MainWindow(QMainWindow):
                 force_seek=True,
                 reason="seek",
             )
+            self.show_local_playback_osd("seek", position)
             self.last_known_playing = playing
             self.remember_polled_state(position, playing, observed_at)
             return
@@ -2205,6 +2242,7 @@ class MainWindow(QMainWindow):
                 playing,
                 reason="play" if playing else "pause",
             )
+            self.show_local_playback_osd("play" if playing else "pause", position)
         self.last_known_playing = playing
         self.remember_polled_state(position, playing, observed_at)
 
@@ -2476,10 +2514,15 @@ class MainWindow(QMainWindow):
             f"Room sync: {self.room_sync_state} / {self.room_sync_note or '<none>'}",
             f"Approx drift: {self.current_drift_text()}",
             f"Current media URL: {self.current_media_url or '<none>'}",
+            f"mpv available: {self.player.mpv_available()}",
             f"mpv running: {self.player.is_running()}",
             f"mpv path: {self.player.mpv_path}",
             f"yt-dlp available: {self.player.yt_dlp_available()}",
             f"yt-dlp path: {self.player.yt_dlp_path() or '<none>'}",
+            f"Windows runtime mpv cache path: {windows_runtime_mpv_path() if os.name == 'nt' else '<not Windows>'}",
+            f"Windows runtime mpv cache available: {windows_mpv_available() if os.name == 'nt' else '<not Windows>'}",
+            f"Windows runtime yt-dlp cache path: {windows_runtime_yt_dlp_path() if os.name == 'nt' else '<not Windows>'}",
+            f"Windows runtime yt-dlp cache available: {windows_yt_dlp_available() if os.name == 'nt' else '<not Windows>'}",
             f"Player status: {player_status}",
             f"Last payload event_id: {payload.get('event_id', '<none>')}",
             f"Last payload seek_token: {payload.get('seek_token', '<none>')}",
@@ -2748,6 +2791,13 @@ class MainWindow(QMainWindow):
             return f"{hours}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:02d}:{seconds:02d}"
 
+    @staticmethod
+    def format_osd_actor_name(name: str, fallback: str) -> str:
+        clean_name = " ".join(str(name or "").strip().split()) or fallback
+        if len(clean_name) > 24:
+            clean_name = clean_name[:21].rstrip() + "..."
+        return clean_name
+
     def remote_actor_name(self, payload: dict) -> str:
         name = str(payload.get("updated_by_name") or "").strip()
         updated_by = str(payload.get("updated_by") or "")
@@ -2756,16 +2806,16 @@ class MainWindow(QMainWindow):
                 if str(member.get("id") or "") == updated_by:
                     name = str(member.get("name") or "").strip()
                     break
-        if not name:
-            name = "Someone"
-        name = " ".join(name.split())
-        if len(name) > 24:
-            name = name[:21].rstrip() + "..."
-        return name
+        return self.format_osd_actor_name(name, "Someone")
 
-    def build_remote_action_osd_message(self, payload: dict, actor_name: str) -> str | None:
-        action = str(payload.get("last_action") or "").strip().lower()
-        position_ms = int(payload.get("position_ms") or 0)
+    def local_actor_name(self) -> str:
+        name = self.name_input.text().strip() if hasattr(self, "name_input") else ""
+        if not name:
+            name = str(getattr(self.sync_client, "name", "") or "").strip()
+        return self.format_osd_actor_name(name, "guest")
+
+    def build_action_osd_message(self, action: str, actor_name: str, position_ms: int = 0) -> str | None:
+        action = str(action or "").strip().lower()
         if action == "pause":
             return f"{actor_name} paused at {self.format_osd_time(position_ms)}"
         if action == "play":
@@ -2775,6 +2825,36 @@ class MainWindow(QMainWindow):
         if action == "load":
             return f"{actor_name} loaded new media"
         return None
+
+    def build_remote_action_osd_message(self, payload: dict, actor_name: str) -> str | None:
+        return self.build_action_osd_message(
+            str(payload.get("last_action") or ""),
+            actor_name,
+            int(payload.get("position_ms") or 0),
+        )
+
+    def show_local_playback_osd(self, action: str, position_ms: int = 0) -> None:
+        if not self.show_playback_osd:
+            return
+        action = str(action or "").strip().lower()
+        if action not in {"play", "pause", "seek", "load"}:
+            return
+        message = self.build_action_osd_message(action, self.local_actor_name(), position_ms)
+        if not message:
+            return
+        signature = "|".join(
+            [
+                action,
+                str(max(0, int(position_ms)) // 1000),
+                self.current_media_url if action == "load" else "",
+            ]
+        )
+        now = time.monotonic()
+        if signature == self.last_local_osd_signature and now - self.last_local_osd_at < 1.5:
+            return
+        self.last_local_osd_signature = signature
+        self.last_local_osd_at = now
+        self.player.show_osd_message(message)
 
     def maybe_show_remote_playback_osd(self, payload: dict, *, media_switch: bool = False) -> None:
         event_id = int(payload.get("event_id") or 0)

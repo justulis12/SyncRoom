@@ -95,9 +95,9 @@ class StartupSetupDialog(ProgressScreenDialog):
     def __init__(self) -> None:
         super().__init__(
             "FIRST-TIME SETUP",
-            "Installing the video player",
+            "Installing media tools",
             (
-                "SyncRoom is downloading and preparing mpv for Windows. "
+                "SyncRoom is downloading and preparing mpv and yt-dlp for Windows. "
                 "The app will open automatically when setup finishes."
             ),
         )
