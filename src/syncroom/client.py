@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import faulthandler
 import os
 import platform
 import subprocess
 import sys
-import tempfile
-import threading
 import time
 import traceback
 from pathlib import Path
@@ -14,11 +11,10 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFontMetrics
-from PySide6.QtNetwork import QAbstractSocket, QTcpSocket
+from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
-    QComboBox,
     QDialog,
     QFrame,
     QGraphicsDropShadowEffect,
@@ -28,83 +24,40 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
     QSizePolicy,
     QStackedWidget,
     QStyle,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from syncroom import __version__
 from syncroom.mpv_controller import MpvController
-from syncroom.protocol import decode_message, encode_message
-from syncroom.settings import app_config_dir, default_display_name, load_settings, logs_dir, save_settings
+from syncroom.network.sync_client import SyncClient
+from syncroom.settings import app_config_dir, default_display_name, load_settings, save_settings
+from syncroom.ui.dialogs import StartupSetupDialog, UpdateAvailableDialog
+from syncroom.ui.widgets import NoWheelComboBox
 from syncroom.updates import (
     UpdateInfo,
     check_for_updates,
 )
+from syncroom.utils.logging import (
+    append_runtime_log,
+    append_update_log,
+    configure_crash_logging,
+    flush_fault_log,
+    runtime_log_path,
+    safe_logs_dir,
+    update_log_path,
+)
 from syncroom.windows_runtime import ensure_windows_mpv_runtime
 
 
-def update_log_path() -> Path:
-    return safe_logs_dir() / "update.log"
-
-
-def append_update_log(message: str) -> None:
-    _append_log(update_log_path(), message)
-
-
-_FAULT_LOG_HANDLE = None
-MAX_LOG_BYTES = 256 * 1024
 THREAD_SHUTDOWN_TIMEOUT_MS = 5000
 THREAD_FORCE_TERMINATE_TIMEOUT_MS = 2000
-
-
-def runtime_log_path() -> Path:
-    return safe_logs_dir() / "runtime.log"
-
-
-def safe_logs_dir() -> Path:
-    try:
-        return logs_dir()
-    except Exception:
-        fallback = Path(tempfile.gettempdir()) / "syncroom-logs"
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
-
-
-def prepare_log_file(path: Path) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8"):
-            pass
-    except Exception:
-        pass
-
-
-def _append_log(path: Path, message: str) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and path.stat().st_size > MAX_LOG_BYTES:
-            path.write_text("", encoding="utf-8")
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
-            handle.flush()
-    except Exception:
-        return
-
-
-def append_runtime_log(message: str) -> None:
-    _append_log(runtime_log_path(), message)
-
-
-def append_crash_log(message: str) -> None:
-    _append_log(safe_logs_dir() / "crash.log", message)
 
 
 def qapplication_is_closing() -> bool:
@@ -141,178 +94,6 @@ def stop_thread_with_timeout(
     return False
 
 
-def configure_crash_logging() -> None:
-    global _FAULT_LOG_HANDLE
-    try:
-        log_root = safe_logs_dir()
-        prepare_log_file(log_root / "runtime.log")
-        crash_path = log_root / "crash.log"
-        prepare_log_file(crash_path)
-        _FAULT_LOG_HANDLE = crash_path.open("a", encoding="utf-8", buffering=1)
-        faulthandler.enable(_FAULT_LOG_HANDLE, all_threads=True)
-        append_runtime_log(f"Logging initialized in {log_root}")
-    except Exception:
-        _FAULT_LOG_HANDLE = None
-        return
-
-    def handle_exception(exc_type, exc_value, exc_traceback) -> None:
-        details = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-        append_crash_log("Uncaught exception:\n" + details)
-        append_runtime_log(
-            f"Uncaught exception logged: {exc_value}"
-        )
-        if _FAULT_LOG_HANDLE is not None:
-            _FAULT_LOG_HANDLE.flush()
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-
-    def handle_thread_exception(args) -> None:
-        details = "".join(
-            traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
-        )
-        append_crash_log("Thread exception:\n" + details)
-        append_runtime_log(f"Thread exception logged: {args.exc_value}")
-        if _FAULT_LOG_HANDLE is not None:
-            _FAULT_LOG_HANDLE.flush()
-
-    sys.excepthook = handle_exception
-    threading.excepthook = handle_thread_exception
-
-
-class SyncClient(QObject):
-    room_state = Signal(dict)
-    info = Signal(str)
-    error = Signal(str)
-    connected = Signal()
-    disconnected = Signal()
-    pong = Signal()
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.socket = QTcpSocket(self)
-        self.socket.readyRead.connect(self._on_ready_read)
-        self.socket.connected.connect(self._on_socket_connected)
-        self.socket.disconnected.connect(self.disconnected)
-        self.socket.errorOccurred.connect(self._on_error)
-        self._buffer = bytearray()
-        self._pending_join_payload: dict | None = None
-        self.client_id = ""
-        self.room = ""
-        self.name = ""
-
-    def connect_to_server(
-        self,
-        host: str,
-        port: int,
-        room: str,
-        name: str,
-        password: str = "",
-    ) -> None:
-        self.room = room
-        self.name = name
-        self.client_id = ""
-        self._buffer.clear()
-        self._pending_join_payload = {
-            "type": "join",
-            "room": room,
-            "name": name,
-            "password": password,
-        }
-        append_runtime_log(
-            f"Connecting to server host={host} port={port} room={room} name={name} password={'yes' if password else 'no'}"
-        )
-        if self.socket.state() != QAbstractSocket.UnconnectedState:
-            self.socket.abort()
-        self.socket.connectToHost(host, port)
-
-    def disconnect_from_server(self) -> None:
-        self._pending_join_payload = None
-        self.client_id = ""
-        if self.socket.state() != QAbstractSocket.UnconnectedState:
-            self.socket.disconnectFromHost()
-
-    def send_state(
-        self,
-        media_url: str,
-        position_ms: int,
-        playing: bool,
-        force_seek: bool = False,
-        reason: str = "",
-    ) -> None:
-        if self.socket.state() != QAbstractSocket.ConnectedState:
-            return
-        self.send(
-            {
-                "type": "state",
-                "media_url": media_url,
-                "position_ms": position_ms,
-                "playing": playing,
-                "force_seek": force_seek,
-                "reason": reason,
-            }
-        )
-
-    def send(self, payload: dict) -> None:
-        if self.socket.state() != QAbstractSocket.ConnectedState:
-            return
-        self.socket.write(encode_message(payload))
-
-    def _on_socket_connected(self) -> None:
-        if self._pending_join_payload is not None:
-            self.send(self._pending_join_payload)
-
-    def _on_ready_read(self) -> None:
-        self._buffer.extend(self.socket.readAll().data())
-        while b"\n" in self._buffer:
-            raw_line, _, remainder = self._buffer.partition(b"\n")
-            self._buffer = bytearray(remainder)
-            if not raw_line.strip():
-                continue
-            try:
-                payload = decode_message(raw_line)
-            except Exception as exc:
-                self.error.emit(f"Invalid message from server: {exc}")
-                continue
-            self._handle_message(payload)
-
-    def _handle_message(self, payload: dict) -> None:
-        msg_type = payload.get("type")
-        if msg_type == "welcome":
-            self.client_id = str(payload.get("client_id") or "")
-            self._pending_join_payload = None
-            append_runtime_log(
-                f"Connected to room welcome room={payload.get('room')} client_id={self.client_id}"
-            )
-            self.info.emit(f"Connected to room {payload.get('room')}")
-            self.connected.emit()
-        elif msg_type == "room_state":
-            self.room_state.emit(payload)
-        elif msg_type == "pong":
-            self.pong.emit()
-        elif msg_type == "error":
-            message = str(payload.get("message") or "Unknown server error")
-            append_runtime_log(f"Server error: {message}")
-            self.error.emit(message)
-            if not self.client_id and self.is_join_rejection(message):
-                self._pending_join_payload = None
-                self.socket.abort()
-
-    def _on_error(self, _socket_error: QAbstractSocket.SocketError) -> None:
-        self.error.emit(self.socket.errorString())
-
-    @staticmethod
-    def is_join_rejection(message: str) -> bool:
-        lowered = message.strip().lower()
-        return any(fragment in lowered for fragment in ("password", "auth", "join", "first message"))
-
-
-class NoWheelComboBox(QComboBox):
-    def wheelEvent(self, event) -> None:  # type: ignore[override]
-        if self.view().isVisible():
-            super().wheelEvent(event)
-            return
-        event.ignore()
-
-
 class WindowsRuntimeInstallerWorker(QObject):
     progress = Signal(str, int)
     finished = Signal()
@@ -335,210 +116,6 @@ class UpdateCheckWorker(QObject):
 
     def run(self) -> None:
         self.finished.emit(check_for_updates())
-
-
-class ProgressScreenDialog(QDialog):
-    def __init__(self, eyebrow_text: str, title_text: str, subtitle_text: str) -> None:
-        super().__init__()
-        self.setWindowTitle("SyncRoom Setup")
-        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
-        self.setWindowFlag(Qt.WindowCloseButtonHint, False)
-        self.setModal(True)
-        self.setFixedSize(520, 240)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 28, 28, 28)
-        layout.setSpacing(14)
-
-        eyebrow = QLabel(eyebrow_text)
-        eyebrow.setObjectName("eyebrow")
-        title = QLabel(title_text)
-        title.setObjectName("title")
-        title.setWordWrap(True)
-        subtitle = QLabel(subtitle_text)
-        subtitle.setObjectName("subtitle")
-        subtitle.setWordWrap(True)
-
-        self.status_label = QLabel("Preparing setup...")
-        self.status_label.setObjectName("setupStatus")
-        self.status_label.setWordWrap(True)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-
-        layout.addWidget(eyebrow)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addStretch(1)
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.progress_bar)
-
-        self.setStyleSheet(
-            """
-            QDialog {
-                background: #050505;
-                color: #f2f2f4;
-                font-family: "Noto Sans", "Cantarell", sans-serif;
-            }
-            QLabel#eyebrow {
-                color: #b8b8bf;
-                font-size: 11px;
-                font-weight: 800;
-                letter-spacing: 0.12em;
-            }
-            QLabel#title {
-                color: #ffffff;
-                font-size: 28px;
-                font-weight: 800;
-            }
-            QLabel#subtitle, QLabel#setupStatus {
-                color: #b9b9c0;
-                font-size: 14px;
-            }
-            QProgressBar {
-                min-height: 18px;
-                border-radius: 9px;
-                border: 1px solid #525257;
-                background: #101011;
-                color: #f3f3f5;
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                border-radius: 8px;
-                background: #f0f0f2;
-            }
-            """
-        )
-
-    def set_progress(self, message: str, percent: int) -> None:
-        self.status_label.setText(message)
-        self.progress_bar.setValue(percent)
-
-
-class StartupSetupDialog(ProgressScreenDialog):
-    def __init__(self) -> None:
-        super().__init__(
-            "FIRST-TIME SETUP",
-            "Installing the video player",
-            (
-                "SyncRoom is downloading and preparing mpv for Windows. "
-                "The app will open automatically when setup finishes."
-            ),
-        )
-
-
-class UpdateAvailableDialog(QDialog):
-    def __init__(self, current_version: str, latest_version: str) -> None:
-        super().__init__()
-        self.setWindowTitle("SyncRoom Update")
-        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
-        self.setModal(True)
-        self.setFixedSize(460, 300)
-
-        shell = QVBoxLayout(self)
-        shell.setContentsMargins(18, 18, 18, 18)
-        shell.setSpacing(0)
-
-        card = QFrame()
-        card.setObjectName("updateCard")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(24, 24, 24, 22)
-        card_layout.setSpacing(14)
-
-        eyebrow = QLabel("UPDATE AVAILABLE")
-        eyebrow.setObjectName("updateEyebrow")
-        title = QLabel("A new SyncRoom is ready")
-        title.setObjectName("updateTitle")
-        title.setWordWrap(True)
-        body = QLabel("SyncRoom will close, update, and reopen automatically.")
-        body.setObjectName("updateBody")
-        body.setWordWrap(True)
-
-        version_text = QLabel(f"Current {current_version}  |  Latest {latest_version}")
-        version_text.setObjectName("updateVersion")
-
-        buttons = QHBoxLayout()
-        buttons.setSpacing(10)
-        buttons.addStretch(1)
-        later_button = QPushButton("Later")
-        later_button.setObjectName("secondaryButton")
-        update_button = QPushButton("Update now")
-        update_button.setObjectName("primaryButton")
-        update_button.setDefault(True)
-        buttons.addWidget(later_button)
-        buttons.addWidget(update_button)
-
-        card_layout.addWidget(eyebrow)
-        card_layout.addWidget(title)
-        card_layout.addWidget(body)
-        card_layout.addWidget(version_text)
-        card_layout.addStretch(1)
-        card_layout.addLayout(buttons)
-        shell.addWidget(card)
-
-        later_button.clicked.connect(self.reject)
-        update_button.clicked.connect(self.accept)
-
-        self.setStyleSheet(
-            """
-            QDialog {
-                background: #000000;
-                color: #f6f6f7;
-                font-family: "Noto Sans", "Cantarell", sans-serif;
-            }
-            QFrame#updateCard {
-                background: #080808;
-                border: 1px solid #303034;
-                border-radius: 14px;
-            }
-            QLabel#updateEyebrow {
-                color: #a6a6ad;
-                font-size: 11px;
-                font-weight: 800;
-                letter-spacing: 0.12em;
-            }
-            QLabel#updateTitle {
-                color: #ffffff;
-                font-size: 24px;
-                font-weight: 800;
-            }
-            QLabel#updateBody {
-                color: #c8c8ce;
-                font-size: 14px;
-                line-height: 1.3;
-            }
-            QLabel#updateVersion {
-                color: #8f8f98;
-                font-size: 12px;
-            }
-            QPushButton {
-                min-width: 96px;
-                min-height: 34px;
-                border-radius: 8px;
-                padding: 0 16px;
-                font-size: 13px;
-                font-weight: 700;
-            }
-            QPushButton#primaryButton {
-                color: #050505;
-                background: #f2f2f4;
-                border: 1px solid #ffffff;
-            }
-            QPushButton#primaryButton:hover {
-                background: #ffffff;
-            }
-            QPushButton#secondaryButton {
-                color: #eeeeef;
-                background: #151516;
-                border: 1px solid #36363a;
-            }
-            QPushButton#secondaryButton:hover {
-                background: #202023;
-            }
-            """
-        )
 
 
 def prepare_windows_runtime_if_needed() -> bool:
@@ -3309,11 +2886,7 @@ class MainWindow(QMainWindow):
             app.processEvents()
         self.best_effort_update_shutdown()
         append_update_log("hard exit starting")
-        if _FAULT_LOG_HANDLE is not None:
-            try:
-                _FAULT_LOG_HANDLE.flush()
-            except Exception:
-                pass
+        flush_fault_log()
         os._exit(0)
 
     def best_effort_update_shutdown(self) -> None:
