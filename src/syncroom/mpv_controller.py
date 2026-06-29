@@ -111,6 +111,11 @@ class MpvController:
             f"--input-ipc-server={self.ipc_path}",
             "--title=SyncRoom Player",
             "--profile=sw-fast",
+            "--osd-align-x=left",
+            "--osd-align-y=top",
+            "--osd-margin-x=24",
+            "--osd-margin-y=24",
+            "--osd-font-size=28",
         ]
         ytdlp_path = self.yt_dlp_path()
         if ytdlp_path:
@@ -154,6 +159,23 @@ class MpvController:
 
     def seek_absolute(self, position_ms: int) -> None:
         self.command(["set_property", "time-pos", max(0.0, position_ms / 1000.0)])
+
+    def show_osd_message(self, text: str, duration_ms: int = 2800) -> None:
+        if not self.is_running():
+            return
+        cleaned = "".join(
+            ch if ch.isprintable() and ch not in "\r\n\t" else " "
+            for ch in str(text or "")
+        )
+        cleaned = " ".join(cleaned.split())
+        if not cleaned:
+            return
+        if len(cleaned) > 160:
+            cleaned = cleaned[:157].rstrip() + "..."
+        try:
+            self.command(["show-text", cleaned, max(500, int(duration_ms))])
+        except Exception:
+            return
 
     def list_audio_tracks(self) -> list[dict[str, Any]]:
         track_list = self.get_property("track-list", [])

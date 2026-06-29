@@ -31,6 +31,7 @@ class RoomState:
     last_action: str = ""
     updated_at: float = field(default_factory=time.time)
     updated_by: str = ""
+    updated_by_name: str = ""
 
     def snapshot(self) -> dict[str, object]:
         position_ms = self.position_ms
@@ -47,6 +48,7 @@ class RoomState:
             "event_id": self.event_id,
             "last_action": self.last_action,
             "updated_by": self.updated_by,
+            "updated_by_name": self.updated_by_name,
             "members": [{"id": c.client_id, "name": c.name} for c in self.clients.values()],
         }
 
@@ -140,6 +142,7 @@ class SyncRoomServer:
             room.last_action = reason
             room.updated_at = time.time()
             room.updated_by = client.client_id
+            room.updated_by_name = client.name
             await self.broadcast_room(room.room)
         elif msg_type == "ping":
             client.writer.write(encode_message({"type": "pong"}))

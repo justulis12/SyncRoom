@@ -241,6 +241,9 @@ class MainWindow(QMainWindow):
         self.update_in_progress = False
         self.last_applied_seek_token = 0
         self.last_applied_event_id = 0
+        self.last_osd_event_id = 0
+        self.last_osd_signature = ""
+        self.show_playback_osd = True
         self.behind_sync_detected_at: float | None = None
         self.player_seen_running_in_room = False
         self.reconnect_enabled = False
@@ -2229,19 +2232,26 @@ class MainWindow(QMainWindow):
         media_url = str(payload.get("media_url") or "")
         position_ms = int(payload.get("position_ms") or 0)
         updated_by = str(payload.get("updated_by") or "")
+        event_id = int(payload.get("event_id") or 0)
+        first_room_payload = self.last_room_payload is None
         self.last_room_payload = dict(payload)
         self.update_diagnostics()
+
+        if first_room_payload and event_id > 0:
+            self.last_osd_event_id = max(self.last_osd_event_id, event_id)
 
         if not media_url:
             return
 
         if updated_by == self.sync_client.client_id:
+            self.last_osd_event_id = max(self.last_osd_event_id, event_id)
             return
 
         if media_url != self.current_media_url:
             append_runtime_log(
                 f"Late join or media switch detected current={self.current_media_url or '<none>'}"
             )
+            self.maybe_show_remote_playback_osd(payload, media_switch=True)
             self.url_input.setText(media_url)
             self.set_media_url(media_url, broadcast=False)
             self.start_pending_room_sync(payload, "loading", "Waiting for stream...")
@@ -2262,11 +2272,13 @@ class MainWindow(QMainWindow):
         try:
             self.apply_server_state(payload, settle_mode=False)
             self.update_room_sync_state("live", "room sync active")
+            self.maybe_show_remote_playback_osd(payload)
         except Exception as exc:
             append_runtime_log(f"on_room_state sync exception: {exc}")
             if self.is_recoverable_sync_error(exc):
                 self.show_status("Waiting for playback to finish loading...")
                 self.start_pending_room_sync(payload, "recovering", "Catching up to the room...")
+                self.maybe_show_remote_playback_osd(payload)
             else:
                 self.show_transient_error(f"Could not sync mpv state: {exc}")
         finally:
@@ -2726,6 +2738,80 @@ class MainWindow(QMainWindow):
         if title:
             return f"{lang} - {title}"
         return lang
+
+    @staticmethod
+    def format_osd_time(position_ms: int) -> str:
+        total_seconds = max(0, int(position_ms) // 1000)
+        minutes, seconds = divmod(total_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def remote_actor_name(self, payload: dict) -> str:
+        name = str(payload.get("updated_by_name") or "").strip()
+        updated_by = str(payload.get("updated_by") or "")
+        if not name and updated_by:
+            for member in payload.get("members") or []:
+                if str(member.get("id") or "") == updated_by:
+                    name = str(member.get("name") or "").strip()
+                    break
+        if not name:
+            name = "Someone"
+        name = " ".join(name.split())
+        if len(name) > 24:
+            name = name[:21].rstrip() + "..."
+        return name
+
+    def build_remote_action_osd_message(self, payload: dict, actor_name: str) -> str | None:
+        action = str(payload.get("last_action") or "").strip().lower()
+        position_ms = int(payload.get("position_ms") or 0)
+        if action == "pause":
+            return f"{actor_name} paused at {self.format_osd_time(position_ms)}"
+        if action == "play":
+            return f"{actor_name} resumed"
+        if action == "seek":
+            return f"{actor_name} skipped to {self.format_osd_time(position_ms)}"
+        if action == "load":
+            return f"{actor_name} loaded new media"
+        return None
+
+    def maybe_show_remote_playback_osd(self, payload: dict, *, media_switch: bool = False) -> None:
+        event_id = int(payload.get("event_id") or 0)
+        action = str(payload.get("last_action") or "").strip().lower()
+        updated_by = str(payload.get("updated_by") or "")
+        if event_id <= 0:
+            return
+        if event_id <= self.last_osd_event_id:
+            return
+        if not self.show_playback_osd or updated_by == self.sync_client.client_id:
+            self.last_osd_event_id = max(self.last_osd_event_id, event_id)
+            return
+        if action not in {"play", "pause", "seek", "load"}:
+            self.last_osd_event_id = max(self.last_osd_event_id, event_id)
+            return
+        if media_switch and action != "load":
+            self.last_osd_event_id = max(self.last_osd_event_id, event_id)
+            return
+
+        signature = "|".join(
+            [
+                updated_by,
+                action,
+                str(int(payload.get("position_ms") or 0)),
+                str(int(payload.get("seek_token") or 0)),
+                str(payload.get("media_url") or ""),
+            ]
+        )
+        if signature and signature == self.last_osd_signature:
+            self.last_osd_event_id = max(self.last_osd_event_id, event_id)
+            return
+
+        message = self.build_remote_action_osd_message(payload, self.remote_actor_name(payload))
+        self.last_osd_event_id = max(self.last_osd_event_id, event_id)
+        self.last_osd_signature = signature
+        if message:
+            self.player.show_osd_message(message)
 
     @staticmethod
     def format_ms(value: int) -> str:
