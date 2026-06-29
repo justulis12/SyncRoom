@@ -25,6 +25,7 @@ class MpvController:
     AUDIO_ALIAS_GROUPS = [
         {"eng", "en", "english"},
         {"jp", "jpn", "ja", "jap", "japanese"},
+        {"spa", "es", "spanish"},
     ]
     ENGLISH_ALIASES = {"eng", "en", "english"}
     SIGNS_SONGS_TOKENS = {"sign", "signs", "song", "songs", "forced", "ss", "signssongs"}
@@ -36,6 +37,7 @@ class MpvController:
         self._request_id = 0
         self.mpv_path = self._resolve_mpv_path()
         self._attempted_runtime_install = False
+        self.ytdl_format = "bv*[height<=1080]+ba/b[height<=1080]/b"
 
     def _resolve_mpv_path(self) -> str:
         candidates: list[Path] = []
@@ -116,6 +118,7 @@ class MpvController:
                 [
                     "--ytdl=yes",
                     f"--script-opts-append=ytdl_hook-ytdl_path={ytdlp_path}",
+                    f"--ytdl-format={self.ytdl_format}",
                 ]
             )
         try:
@@ -143,6 +146,15 @@ class MpvController:
         self.ensure_running()
         self.command(["loadfile", media_url, "replace"])
         self.command(["set_property", "pause", True])
+
+    def set_ytdl_format(self, value: str) -> None:
+        self.ytdl_format = str(value or "").strip() or "bv*[height<=1080]+ba/b[height<=1080]/b"
+        if self.is_running():
+            with contextlib_suppress(Exception):
+                self.command(["set_property", "ytdl-format", self.ytdl_format])
+
+    def effective_ytdl_format(self) -> str:
+        return self.ytdl_format
 
     def play(self) -> None:
         self.command(["set_property", "pause", False])
@@ -275,6 +287,15 @@ class MpvController:
                 ),
                 None,
             )
+        elif mode in {"japanese", "spanish"}:
+            normalized_preferences = self._expand_preferences(preferences or [])
+            for preference in normalized_preferences:
+                chosen = next(
+                    (track for track in tracks if self.track_matches_preference(track, preference)),
+                    None,
+                )
+                if chosen is not None:
+                    break
         elif mode == "custom":
             normalized_preferences = self._expand_preferences(preferences or [])
             for preference in normalized_preferences:

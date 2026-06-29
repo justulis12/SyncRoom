@@ -39,6 +39,7 @@ from syncroom.mpv_controller import MpvController
 from syncroom.network.sync_client import SyncClient
 from syncroom.settings import app_config_dir, default_display_name, load_settings, save_settings
 from syncroom.ui.dialogs import StartupSetupDialog, UpdateAvailableDialog
+from syncroom.ui.settings_panel import SettingsPanel
 from syncroom.ui.widgets import NoWheelComboBox
 from syncroom.updates import (
     UpdateInfo,
@@ -272,7 +273,7 @@ class MainWindow(QMainWindow):
         self.last_osd_signature = ""
         self.last_local_osd_signature = ""
         self.last_local_osd_at = 0.0
-        self.show_playback_osd = True
+        self.show_playback_osd = self.settings_bool(self.settings.get("playback_osd", True))
         self.behind_sync_detected_at: float | None = None
         self.player_seen_running_in_room = False
         self.reconnect_enabled = False
@@ -320,7 +321,7 @@ class MainWindow(QMainWindow):
             "dashboardShell",
             margins=(18, 18, 18, 18),
             spacing=16,
-            glow_color="#090913",
+            glow_color="#050505",
             glow_alpha=150,
             blur=52,
         )
@@ -330,7 +331,7 @@ class MainWindow(QMainWindow):
             "contentShell",
             margins=(12, 12, 12, 12),
             spacing=0,
-            glow_color="#0d1020",
+            glow_color="#050505",
             glow_alpha=120,
             blur=42,
         )
@@ -338,6 +339,12 @@ class MainWindow(QMainWindow):
         self.page_stack.setObjectName("pageStack")
         self.page_stack.addWidget(self.make_scroll_page(self.build_join_page()))
         self.page_stack.addWidget(self.make_scroll_page(self.build_room_page()))
+        self.settings_panel = SettingsPanel(self.settings)
+        self.settings_panel.audioPreferenceChanged.connect(self.on_audio_preference_changed)
+        self.settings_panel.subtitlePreferenceChanged.connect(self.on_subtitle_preference_changed)
+        self.settings_panel.streamingQualityChanged.connect(self.on_streaming_quality_changed)
+        self.settings_panel.playbackNotificationsChanged.connect(self.on_playback_notifications_changed)
+        self.page_stack.addWidget(self.make_scroll_page(self.settings_panel))
         self.page_stack.currentChanged.connect(self.update_page_chrome)
 
         content_layout.addWidget(self.page_stack)
@@ -345,6 +352,7 @@ class MainWindow(QMainWindow):
         root.addWidget(dashboard_shell)
         self.setCentralWidget(central)
         self.statusBar().showMessage("Ready")
+        self.player.set_ytdl_format(self.settings_panel.ytdl_format())
         self.refresh_audio_tracks()
         self.update_page_chrome(self.page_stack.currentIndex())
         QTimer.singleShot(0, self.update_responsive_layouts)
@@ -358,7 +366,7 @@ class MainWindow(QMainWindow):
         object_name: str,
         margins: tuple[int, int, int, int] = (24, 24, 24, 24),
         spacing: int = 16,
-        glow_color: str = "#090b18",
+        glow_color: str = "#050505",
         glow_alpha: int = 125,
         blur: int = 36,
         offset_y: int = 14,
@@ -388,14 +396,14 @@ class MainWindow(QMainWindow):
         shadow.setOffset(0, offset_y)
         widget.setGraphicsEffect(shadow)
 
-    def build_nav_chip(self, text: str) -> QLabel:
-        chip = QLabel(text)
+    def build_nav_chip(self, text: str) -> QPushButton:
+        chip = QPushButton(text)
         chip.setObjectName("navChip")
         chip.setProperty("active", False)
-        chip.setAlignment(Qt.AlignCenter)
+        chip.setCursor(Qt.PointingHandCursor)
         return chip
 
-    def set_nav_chip_active(self, chip: QLabel, active: bool) -> None:
+    def set_nav_chip_active(self, chip: QPushButton, active: bool) -> None:
         chip.setProperty("active", active)
         chip.style().unpolish(chip)
         chip.style().polish(chip)
@@ -406,7 +414,7 @@ class MainWindow(QMainWindow):
             "topBar",
             margins=(10, 10, 10, 10),
             spacing=0,
-            glow_color="#080911",
+            glow_color="#050505",
             glow_alpha=70,
             blur=20,
             offset_y=6,
@@ -419,7 +427,11 @@ class MainWindow(QMainWindow):
         nav_layout.setSpacing(8)
         self.lobby_nav_chip = self.build_nav_chip("Lobby")
         self.room_nav_chip = self.build_nav_chip("Room")
-        for chip in (self.lobby_nav_chip, self.room_nav_chip):
+        self.settings_nav_chip = self.build_nav_chip("Settings")
+        self.lobby_nav_chip.clicked.connect(lambda: self.page_stack.setCurrentIndex(0))
+        self.room_nav_chip.clicked.connect(lambda: self.page_stack.setCurrentIndex(1))
+        self.settings_nav_chip.clicked.connect(lambda: self.page_stack.setCurrentIndex(2))
+        for chip in (self.lobby_nav_chip, self.room_nav_chip, self.settings_nav_chip):
             nav_layout.addWidget(chip)
 
         self.top_bar_row = QHBoxLayout()
@@ -656,7 +668,7 @@ class MainWindow(QMainWindow):
             "heroPanel",
             margins=(26, 26, 26, 26),
             spacing=14,
-            glow_color="#151127",
+            glow_color="#080808",
             glow_alpha=150,
             blur=44,
             offset_y=18,
@@ -713,7 +725,16 @@ class MainWindow(QMainWindow):
         self.leave_room_button.setMinimumHeight(42)
         self.leave_room_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+        self.resync_button = QPushButton("Resync")
+        self.resync_button.setObjectName("ghostButton")
+        self.resync_button.setToolTip("Follow the current room playback state.")
+        self.resync_button.clicked.connect(self.manual_resync_to_room)
+        self.resync_button.setEnabled(False)
+        self.resync_button.setMinimumHeight(42)
+        self.resync_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
         self.room_header_row.addLayout(title_box, 1)
+        self.room_header_row.addWidget(self.resync_button)
         self.room_header_row.addWidget(self.leave_room_button)
 
         self.room_stat_row = QBoxLayout(QBoxLayout.LeftToRight)
@@ -753,111 +774,31 @@ class MainWindow(QMainWindow):
         hero_layout.addLayout(self.badge_row)
         hero_layout.addLayout(self.room_stat_row)
 
-        stage_card, stage_layout = self.build_panel(
-            "stageCard",
-            margins=(24, 24, 24, 24),
-            spacing=16,
-            glow_color="#11131f",
-            glow_alpha=135,
-            blur=40,
-            offset_y=16,
-        )
-
-        stage_header = QHBoxLayout()
-        stage_header.setContentsMargins(0, 0, 0, 0)
-        stage_header.setSpacing(10)
-        stage_header_text = QVBoxLayout()
-        stage_header_text.setContentsMargins(0, 0, 0, 0)
-        stage_header_text.setSpacing(2)
-        stage_overline = QLabel("PLAYBACK")
-        stage_overline.setObjectName("sectionOverline")
-        stage_title = QLabel("Playback")
-        stage_title.setObjectName("sectionTitle")
-        stage_title.setWordWrap(True)
-        stage_header_text.addWidget(stage_overline)
-        stage_header_text.addWidget(stage_title)
-        stage_header.addLayout(stage_header_text, 1)
-
-        self.player_hint = QLabel("mpv window")
-        self.player_hint.setObjectName("playerHint")
-        self.player_hint.setAlignment(Qt.AlignLeft)
-        self.current_media_label = QLabel("No media loaded yet")
-        self.current_media_label.setObjectName("mediaLabel")
-        self.configure_resizable_label(self.current_media_label, wrap=False)
-        self.current_media_label.setMinimumHeight(18)
-        self.set_label_text_safe(
-            self.current_media_label,
-            "No media loaded yet",
-            elide_mode=Qt.ElideMiddle,
-        )
-
         self.member_label = QLabel("Members: none")
         self.member_label.setObjectName("memberList")
         self.configure_resizable_label(self.member_label, wrap=False)
         self.member_label.setMinimumHeight(18)
+        self.member_label.hide()
         self.set_label_text_safe(self.member_label, "Members: none", elide_mode=Qt.ElideRight)
 
-        media_surface, media_surface_layout = self.build_panel(
-            "mediaSurface",
-            margins=(22, 22, 22, 22),
-            spacing=12,
-            glow_color="#0e1020",
-            glow_alpha=80,
-            blur=24,
-            offset_y=10,
-        )
-        media_surface_layout.setContentsMargins(20, 20, 20, 20)
-        media_surface_layout.setSpacing(10)
-        media_surface_layout.addWidget(self.player_hint)
-        media_surface_layout.addWidget(self.current_media_label)
-        media_surface_layout.addStretch(1)
-        media_surface_layout.addWidget(self.member_label)
-
-        stage_layout.addLayout(stage_header)
-        stage_layout.addWidget(media_surface, 1)
-
-        transport_card, transport_layout = self.build_panel(
-            "transportCard",
-            margins=(18, 18, 18, 18),
-            spacing=10,
-            glow_color="#101220",
-            glow_alpha=105,
-            blur=28,
-            offset_y=10,
-        )
-
-        self.transport_top = QBoxLayout(QBoxLayout.LeftToRight)
-        self.transport_top.setContentsMargins(0, 0, 0, 0)
-        self.transport_top.setSpacing(12)
         self.play_button = QPushButton("Play")
         self.play_button.setObjectName("primaryButton")
         self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.play_button.clicked.connect(self.toggle_playback)
-        self.resync_button = QPushButton("Resync")
-        self.resync_button.setObjectName("ghostButton")
-        self.resync_button.setToolTip("Follow the current room playback state.")
-        self.resync_button.clicked.connect(self.manual_resync_to_room)
-        self.resync_button.setEnabled(False)
+        self.play_button.hide()
         self.position_label = QLabel("00:00")
         self.position_label.setObjectName("timeLabel")
+        self.position_label.hide()
         self.duration_label = QLabel("00:00")
         self.duration_label.setObjectName("timeLabel")
+        self.duration_label.hide()
 
         self.position_slider = QSlider(Qt.Horizontal)
         self.position_slider.sliderPressed.connect(self.on_slider_pressed)
         self.position_slider.sliderReleased.connect(self.on_slider_released)
-
-        self.transport_top.addWidget(self.play_button)
-        self.transport_top.addWidget(self.resync_button)
-        self.transport_top.addWidget(self.position_label)
-        self.transport_top.addWidget(self.position_slider, 1)
-        self.transport_top.addWidget(self.duration_label)
-
-        transport_layout.addLayout(self.transport_top)
+        self.position_slider.hide()
 
         left_column.addWidget(hero_card)
-        left_column.addWidget(stage_card, 1)
-        left_column.addWidget(transport_card)
 
         side_content = QWidget()
         side_content.setObjectName("sidebarCanvas")
@@ -872,7 +813,7 @@ class MainWindow(QMainWindow):
             "sidebarPanel",
             margins=(20, 20, 20, 20),
             spacing=12,
-            glow_color="#101220",
+            glow_color="#070707",
             glow_alpha=110,
             blur=28,
             offset_y=10,
@@ -906,6 +847,17 @@ class MainWindow(QMainWindow):
         self.load_row.addWidget(self.sync_hint_button)
         top_control_layout.addLayout(self.load_row)
 
+        self.current_media_label = QLabel("No media loaded yet")
+        self.current_media_label.setObjectName("mediaLabel")
+        self.configure_resizable_label(self.current_media_label, wrap=False)
+        self.current_media_label.setMinimumHeight(18)
+        self.set_label_text_safe(
+            self.current_media_label,
+            "No media loaded yet",
+            elide_mode=Qt.ElideMiddle,
+        )
+        top_control_layout.addWidget(self.current_media_label)
+
         ytdlp_note = "yt-dlp available" if self.player.yt_dlp_available() else "yt-dlp not found"
         stream_note = QLabel(f"Direct links work. Web links use yt-dlp when available ({ytdlp_note}).")
         stream_note.setObjectName("inlineNote")
@@ -916,44 +868,19 @@ class MainWindow(QMainWindow):
             "sidebarPanel",
             margins=(20, 20, 20, 20),
             spacing=12,
-            glow_color="#101220",
+            glow_color="#070707",
             glow_alpha=110,
             blur=28,
             offset_y=10,
         )
 
-        audio_title = QLabel("Audio")
+        audio_title = QLabel("Audio track")
         audio_title.setObjectName("sectionTitle")
         audio_overline = QLabel("TRACKS")
         audio_overline.setObjectName("sectionOverline")
 
-        self.audio_pref_input = QLineEdit(
-            str(self.settings.get("audio_preferences", "") or "eng,en,english")
-        )
-        self.audio_pref_input.setPlaceholderText("Preferred audio")
-
         audio_layout.addWidget(audio_overline)
         audio_layout.addWidget(audio_title)
-        audio_layout.addWidget(self.audio_pref_input)
-
-        self.audio_pref_row = QBoxLayout(QBoxLayout.LeftToRight)
-        self.audio_pref_row.setContentsMargins(0, 0, 0, 0)
-        self.audio_pref_row.setSpacing(10)
-        self.prefer_english_button = QPushButton("English")
-        self.prefer_english_button.setObjectName("pillButton")
-        self.prefer_english_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.prefer_english_button.clicked.connect(
-            lambda: self.set_audio_preferences("eng,en,english")
-        )
-        self.prefer_japanese_button = QPushButton("Japanese")
-        self.prefer_japanese_button.setObjectName("pillButton")
-        self.prefer_japanese_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.prefer_japanese_button.clicked.connect(
-            lambda: self.set_audio_preferences("jp,jpn,japanese,jap")
-        )
-        self.audio_pref_row.addWidget(self.prefer_english_button)
-        self.audio_pref_row.addWidget(self.prefer_japanese_button)
-        audio_layout.addLayout(self.audio_pref_row)
 
         self.audio_track_combo = NoWheelComboBox()
         self.audio_track_combo.setMinimumWidth(0)
@@ -979,37 +906,18 @@ class MainWindow(QMainWindow):
             "sidebarPanel",
             margins=(20, 20, 20, 20),
             spacing=12,
-            glow_color="#101220",
+            glow_color="#070707",
             glow_alpha=105,
             blur=26,
             offset_y=9,
         )
 
-        subtitle_title = QLabel("Subtitles")
+        subtitle_title = QLabel("Subtitle track")
         subtitle_title.setObjectName("sectionTitle")
         subtitle_overline = QLabel("CAPTIONS")
         subtitle_overline.setObjectName("sectionOverline")
         subtitle_layout.addWidget(subtitle_overline)
         subtitle_layout.addWidget(subtitle_title)
-
-        self.subtitle_pref_combo = NoWheelComboBox()
-        self.subtitle_pref_combo.setObjectName("elevatedCombo")
-        self.subtitle_pref_combo.addItem("Off", "off")
-        self.subtitle_pref_combo.addItem("English", "english")
-        self.subtitle_pref_combo.addItem("English Signs & Songs", "english_signs")
-        self.subtitle_pref_combo.addItem("Custom", "custom")
-        saved_subtitle_mode = str(self.settings.get("subtitle_mode", "off") or "off")
-        saved_index = self.subtitle_pref_combo.findData(saved_subtitle_mode)
-        self.subtitle_pref_combo.setCurrentIndex(max(0, saved_index))
-        self.subtitle_pref_combo.currentIndexChanged.connect(self.on_subtitle_preference_changed)
-        subtitle_layout.addWidget(self.subtitle_pref_combo)
-
-        self.subtitle_custom_input = QLineEdit(
-            str(self.settings.get("subtitle_custom_preferences", "eng,english") or "eng,english")
-        )
-        self.subtitle_custom_input.setPlaceholderText("Custom subtitle match")
-        self.subtitle_custom_input.editingFinished.connect(self.on_subtitle_custom_changed)
-        subtitle_layout.addWidget(self.subtitle_custom_input)
 
         self.subtitle_track_combo = NoWheelComboBox()
         self.subtitle_track_combo.setMinimumWidth(0)
@@ -1030,13 +938,12 @@ class MainWindow(QMainWindow):
         self.subtitle_action_row.addWidget(self.refresh_subtitle_button)
         self.subtitle_action_row.addWidget(self.use_subtitle_button)
         subtitle_layout.addLayout(self.subtitle_action_row)
-        self.update_subtitle_custom_visibility()
 
         diagnostics_card, diagnostics_layout = self.build_panel(
             "sidebarPanel",
             margins=(18, 18, 18, 18),
             spacing=10,
-            glow_color="#101220",
+            glow_color="#070707",
             glow_alpha=95,
             blur=24,
             offset_y=8,
@@ -1087,14 +994,15 @@ class MainWindow(QMainWindow):
         diagnostics_actions.addWidget(self.open_logs_button)
         diagnostics_layout.addLayout(diagnostics_actions)
 
+        left_column.addWidget(diagnostics_card)
+        left_column.addStretch(1)
         side_layout.addWidget(top_control_card)
         side_layout.addWidget(audio_card)
         side_layout.addWidget(subtitle_card)
-        side_layout.addWidget(diagnostics_card)
         side_layout.addStretch(1)
 
-        self.room_shell_layout.addLayout(left_column, 7)
-        self.room_shell_layout.addWidget(side_content, 4)
+        self.room_shell_layout.addLayout(left_column, 5)
+        self.room_shell_layout.addWidget(side_content, 5)
         layout.addLayout(self.room_shell_layout)
         return page
 
@@ -1204,16 +1112,24 @@ class MainWindow(QMainWindow):
         if object_name == "accentStatCard":
             self.apply_depth_effect(card, "#f1f1f4", 38, 24, 8)
         elif object_name == "miniStatCard":
-            self.apply_depth_effect(card, "#0d1020", 70, 18, 6)
+            self.apply_depth_effect(card, "#070707", 70, 18, 6)
         else:
-            self.apply_depth_effect(card, "#0c0f1b", 82, 22, 7)
+            self.apply_depth_effect(card, "#070707", 82, 22, 7)
         return card
 
     def update_page_chrome(self, index: int) -> None:
         lobby_active = index == 0
         room_active = index == 1
+        settings_active = index == 2
+        in_room_context = bool(self.sync_client.client_id) or (
+            self.reconnect_enabled and not self.user_requested_disconnect and index in {1, 2}
+        )
+        self.lobby_nav_chip.setVisible(not in_room_context)
+        self.room_nav_chip.setVisible(in_room_context)
+        self.settings_nav_chip.setVisible(in_room_context)
         self.set_nav_chip_active(self.lobby_nav_chip, lobby_active)
         self.set_nav_chip_active(self.room_nav_chip, room_active)
+        self.set_nav_chip_active(self.settings_nav_chip, settings_active)
         self.schedule_elide_refresh()
 
     def compute_ui_scale(self) -> float:
@@ -1274,15 +1190,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "room_stat_row"):
             self.room_stat_row.setDirection(QBoxLayout.TopToBottom if width < 980 else QBoxLayout.LeftToRight)
             self.room_stat_row.setSpacing(10)
-        if hasattr(self, "transport_top"):
-            self.transport_top.setDirection(QBoxLayout.TopToBottom if width < 900 else QBoxLayout.LeftToRight)
-            self.transport_top.setSpacing(10)
         if hasattr(self, "load_row"):
             self.load_row.setDirection(QBoxLayout.TopToBottom if width < 960 else QBoxLayout.LeftToRight)
             self.load_row.setSpacing(10)
-        if hasattr(self, "audio_pref_row"):
-            self.audio_pref_row.setDirection(QBoxLayout.TopToBottom if width < 900 else QBoxLayout.LeftToRight)
-            self.audio_pref_row.setSpacing(10)
         if hasattr(self, "audio_action_row"):
             self.audio_action_row.setDirection(QBoxLayout.TopToBottom if width < 960 else QBoxLayout.LeftToRight)
             self.audio_action_row.setSpacing(10)
@@ -1406,7 +1316,14 @@ class MainWindow(QMainWindow):
             QFrame#miniStatCard {
                 border-radius: __MINI_RADIUS__px;
             }
-            QLabel#navChip {
+            QFrame#settingsCard {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(19, 19, 20, 0.96),
+                    stop:1 rgba(10, 10, 11, 0.90));
+                border: 1px solid rgba(78, 78, 82, 0.30);
+                border-radius: __CARD_RADIUS__px;
+            }
+            QPushButton#navChip {
                 min-height: __NAV_H__px;
                 padding: 0 __NAV_PAD__px;
                 border-radius: __NAV_CHIP_RADIUS__px;
@@ -1415,10 +1332,15 @@ class MainWindow(QMainWindow):
                 border: 1px solid transparent;
                 font-weight: 700;
             }
-            QLabel#navChip[active="true"] {
+            QPushButton#navChip:hover {
+                color: #ffffff;
+                background: rgba(28, 28, 30, 0.92);
+                border: 1px solid rgba(255, 255, 255, 0.48);
+            }
+            QPushButton#navChip[active="true"] {
                 color: #ffffff;
                 background: rgba(36, 36, 38, 0.96);
-                border: 1px solid rgba(118, 118, 122, 0.36);
+                border: 1px solid rgba(255, 255, 255, 0.55);
             }
             QLabel#offlineBadge {
                 background: rgba(28, 28, 29, 0.94);
@@ -1475,7 +1397,7 @@ class MainWindow(QMainWindow):
                 font-weight: 800;
             }
             QLabel#sectionTitle {
-                color: #fbfcff;
+                color: #fbfbfb;
                 font-size: __SECTION_PX__px;
                 font-weight: 800;
             }
@@ -1542,16 +1464,16 @@ class MainWindow(QMainWindow):
                 border: 1px solid rgba(86, 86, 90, 0.28);
                 padding: 0 __BUTTON_PAD__px;
                 font-weight: 800;
-                color: #fbfbff;
+                color: #fbfbfb;
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                     stop:0 rgba(17, 17, 18, 0.98),
                     stop:1 rgba(10, 10, 10, 0.92));
             }
             QPushButton:hover {
-                border: 1px solid rgba(122, 122, 128, 0.40);
+                border: 1px solid rgba(255, 255, 255, 0.55);
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 rgba(21, 21, 22, 0.98),
-                    stop:1 rgba(14, 14, 14, 0.94));
+                    stop:0 rgba(26, 26, 27, 0.99),
+                    stop:1 rgba(16, 16, 17, 0.96));
             }
             QPushButton:pressed {
                 padding-top: 1px;
@@ -1587,13 +1509,13 @@ class MainWindow(QMainWindow):
                     stop:0 rgba(16, 16, 17, 0.92),
                     stop:1 rgba(11, 11, 11, 0.88));
                 border: 1px solid rgba(76, 76, 80, 0.26);
-                color: #f1f3ff;
+                color: #f1f1f3;
             }
             QPushButton#ghostButton:hover, QPushButton#pillButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                     stop:0 rgba(20, 20, 21, 0.98),
                     stop:1 rgba(14, 14, 14, 0.92));
-                border: 1px solid rgba(108, 108, 114, 0.34);
+                border: 1px solid rgba(255, 255, 255, 0.52);
             }
             QPushButton#pillButton {
                 min-height: __PILL_H__px;
@@ -1643,9 +1565,30 @@ class MainWindow(QMainWindow):
                 border-radius: __MENU_RADIUS__px;
                 selection-background-color: rgba(78, 78, 82, 0.86);
                 selection-color: #ffffff;
-                color: #f5f7ff;
+                color: #f5f5f7;
                 outline: 0;
                 padding: 6px;
+            }
+            QCheckBox#settingsCheck {
+                min-height: __CONTROL_H__px;
+                color: #f2f2f4;
+                font-weight: 800;
+                spacing: 10px;
+            }
+            QCheckBox#settingsCheck::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 5px;
+                border: 1px solid rgba(118, 118, 124, 0.44);
+                background: rgba(8, 8, 9, 0.98);
+            }
+            QCheckBox#settingsCheck::indicator:hover {
+                border: 1px solid rgba(255, 255, 255, 0.55);
+                background: rgba(22, 22, 23, 0.98);
+            }
+            QCheckBox#settingsCheck::indicator:checked {
+                border: 1px solid rgba(255, 255, 255, 0.64);
+                background: rgba(236, 236, 238, 0.94);
             }
             QStatusBar {
                 background: rgba(4, 4, 4, 0.99);
@@ -2025,6 +1968,12 @@ class MainWindow(QMainWindow):
         )
         return any(fragment in message for fragment in recoverable_fragments)
 
+    @staticmethod
+    def settings_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() not in {"0", "false", "no", "off", ""}
+
     def update_room_sync_state(self, state: str, note: str = "") -> None:
         self.room_sync_state = state
         self.room_sync_note = note
@@ -2162,7 +2111,7 @@ class MainWindow(QMainWindow):
 
         if not status.get("running", True):
             if (
-                self.page_stack.currentIndex() == 1
+                self.page_stack.currentIndex() in {1, 2}
                 and self.player_seen_running_in_room
                 and not self.pending_room_sync
                 and not self.closing_for_mpv_exit
@@ -2519,6 +2468,8 @@ class MainWindow(QMainWindow):
             f"mpv path: {self.player.mpv_path}",
             f"yt-dlp available: {self.player.yt_dlp_available()}",
             f"yt-dlp path: {self.player.yt_dlp_path() or '<none>'}",
+            f"Selected streaming quality: {self.settings_panel.streaming_quality()}",
+            f"Effective ytdl-format: {self.player.effective_ytdl_format()}",
             f"Windows runtime mpv cache path: {windows_runtime_mpv_path() if os.name == 'nt' else '<not Windows>'}",
             f"Windows runtime mpv cache available: {windows_mpv_available() if os.name == 'nt' else '<not Windows>'}",
             f"Windows runtime yt-dlp cache path: {windows_runtime_yt_dlp_path() if os.name == 'nt' else '<not Windows>'}",
@@ -2596,11 +2547,10 @@ class MainWindow(QMainWindow):
             self.update_diagnostics()
             self.show_status("Disconnected")
 
-    def set_audio_preferences(self, value: str) -> None:
-        self.audio_pref_input.setText(value)
+    def on_audio_preference_changed(self) -> None:
         self.pending_audio_attempts = 10
         self.apply_audio_preferences_with_retry()
-        self.refresh_audio_tracks()
+        self.refresh_audio_tracks(silent=True)
         self.persist_settings()
 
     def apply_audio_preferences_with_retry(self) -> None:
@@ -2617,11 +2567,7 @@ class MainWindow(QMainWindow):
             self.refresh_audio_tracks(silent=True)
 
     def apply_audio_preferences(self) -> bool:
-        preferences = [
-            item.strip()
-            for item in (self.audio_pref_input.text().strip() or "eng,en,english").split(",")
-            if item.strip()
-        ]
+        preferences = self.settings_panel.audio_preferences()
         if not preferences or not self.current_media_url:
             return False
         try:
@@ -2640,32 +2586,24 @@ class MainWindow(QMainWindow):
             return True
         return False
 
-    def update_subtitle_custom_visibility(self) -> None:
-        if not hasattr(self, "subtitle_custom_input"):
-            return
-        custom = self.subtitle_pref_combo.currentData() == "custom"
-        self.subtitle_custom_input.setVisible(custom)
-        self.subtitle_custom_input.setEnabled(custom)
-
     def on_subtitle_preference_changed(self) -> None:
-        self.update_subtitle_custom_visibility()
         self.pending_subtitle_attempts = 10
         self.apply_subtitle_preferences_with_retry()
         self.refresh_subtitle_tracks(silent=True)
         self.persist_settings()
 
-    def on_subtitle_custom_changed(self) -> None:
-        if self.subtitle_pref_combo.currentData() == "custom":
-            self.pending_subtitle_attempts = 10
-            self.apply_subtitle_preferences_with_retry()
-        self.persist_settings()
-
     def subtitle_preferences(self) -> list[str]:
-        return [
-            item.strip()
-            for item in self.subtitle_custom_input.text().split(",")
-            if item.strip()
-        ]
+        return self.settings_panel.subtitle_preferences()
+
+    def on_streaming_quality_changed(self, _quality: str = "") -> None:
+        self.player.set_ytdl_format(self.settings_panel.ytdl_format())
+        self.persist_settings()
+        self.show_status(f"Streaming quality set to {self.settings_panel.streaming_quality()}")
+
+    def on_playback_notifications_changed(self, enabled: bool) -> None:
+        self.show_playback_osd = bool(enabled)
+        self.persist_settings()
+        self.show_status("Playback notifications enabled" if enabled else "Playback notifications disabled")
 
     def apply_subtitle_preferences_with_retry(self) -> None:
         self.refresh_subtitle_tracks(silent=True)
@@ -2683,7 +2621,7 @@ class MainWindow(QMainWindow):
     def apply_subtitle_preferences(self) -> bool:
         if not self.current_media_url:
             return False
-        mode = str(self.subtitle_pref_combo.currentData() or "off")
+        mode = self.settings_panel.subtitle_mode()
         try:
             if mode == "off":
                 self.player.disable_subtitles()
@@ -3112,9 +3050,13 @@ class MainWindow(QMainWindow):
                 "room": self.room_input.text().strip(),
                 "room_password": self.password_input.text(),
                 "name": self.name_input.text().strip(),
-                "audio_preferences": self.audio_pref_input.text().strip() or "eng,en,english",
-                "subtitle_mode": str(self.subtitle_pref_combo.currentData() or "off") if hasattr(self, "subtitle_pref_combo") else "off",
-                "subtitle_custom_preferences": self.subtitle_custom_input.text().strip() if hasattr(self, "subtitle_custom_input") else "eng,english",
+                "audio_mode": self.settings_panel.audio_mode(),
+                "audio_preferences": self.settings_panel.audio_preferences_text(),
+                "audio_custom_preferences": self.settings_panel.audio_custom_preferences(),
+                "subtitle_mode": self.settings_panel.subtitle_mode(),
+                "subtitle_custom_preferences": self.settings_panel.subtitle_custom_preferences(),
+                "streaming_quality": self.settings_panel.streaming_quality(),
+                "playback_osd": self.settings_panel.playback_notifications_enabled(),
             }
         )
 

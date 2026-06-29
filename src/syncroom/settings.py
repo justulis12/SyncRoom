@@ -6,9 +6,13 @@ import os
 from pathlib import Path
 from typing import Any
 
+from PySide6.QtCore import QSettings
+
 
 APP_DIR_NAME = "syncroom"
 SETTINGS_FILE_NAME = "settings.json"
+SETTINGS_ORG = "justys"
+SETTINGS_APP = "SyncRoom"
 
 
 def app_config_dir() -> Path:
@@ -30,6 +34,11 @@ def logs_dir() -> Path:
 
 
 def load_settings() -> dict[str, Any]:
+    qt_settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    keys = qt_settings.allKeys()
+    if keys:
+        return {key: qt_settings.value(key) for key in keys}
+
     path = settings_path()
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -47,6 +56,12 @@ def default_display_name() -> str:
 
 
 def save_settings(payload: dict[str, Any]) -> None:
+    qt_settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    qt_settings.clear()
+    for key, value in payload.items():
+        qt_settings.setValue(key, value)
+    qt_settings.sync()
+
     path = settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
