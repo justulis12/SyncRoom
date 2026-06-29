@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import faulthandler
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -183,17 +184,20 @@ class SyncClient(QObject):
     error = Signal(str)
     connected = Signal()
     disconnected = Signal()
+    pong = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.socket = QTcpSocket(self)
         self.socket.readyRead.connect(self._on_ready_read)
-        self.socket.connected.connect(self.connected)
+        self.socket.connected.connect(self._on_socket_connected)
         self.socket.disconnected.connect(self.disconnected)
         self.socket.errorOccurred.connect(self._on_error)
         self._buffer = bytearray()
+        self._pending_join_payload: dict | None = None
         self.client_id = ""
         self.room = ""
+        self.name = ""
 
     def connect_to_server(
         self,
@@ -205,21 +209,24 @@ class SyncClient(QObject):
     ) -> None:
         self.room = room
         self.name = name
+        self.client_id = ""
+        self._buffer.clear()
+        self._pending_join_payload = {
+            "type": "join",
+            "room": room,
+            "name": name,
+            "password": password,
+        }
         append_runtime_log(
             f"Connecting to server host={host} port={port} room={room} name={name} password={'yes' if password else 'no'}"
         )
+        if self.socket.state() != QAbstractSocket.UnconnectedState:
+            self.socket.abort()
         self.socket.connectToHost(host, port)
-        if self.socket.waitForConnected(3000):
-            self.send(
-                {
-                    "type": "join",
-                    "room": room,
-                    "name": name,
-                    "password": password,
-                }
-            )
 
     def disconnect_from_server(self) -> None:
+        self._pending_join_payload = None
+        self.client_id = ""
         if self.socket.state() != QAbstractSocket.UnconnectedState:
             self.socket.disconnectFromHost()
 
@@ -249,6 +256,10 @@ class SyncClient(QObject):
             return
         self.socket.write(encode_message(payload))
 
+    def _on_socket_connected(self) -> None:
+        if self._pending_join_payload is not None:
+            self.send(self._pending_join_payload)
+
     def _on_ready_read(self) -> None:
         self._buffer.extend(self.socket.readAll().data())
         while b"\n" in self._buffer:
@@ -267,18 +278,31 @@ class SyncClient(QObject):
         msg_type = payload.get("type")
         if msg_type == "welcome":
             self.client_id = str(payload.get("client_id") or "")
+            self._pending_join_payload = None
             append_runtime_log(
                 f"Connected to room welcome room={payload.get('room')} client_id={self.client_id}"
             )
             self.info.emit(f"Connected to room {payload.get('room')}")
+            self.connected.emit()
         elif msg_type == "room_state":
             self.room_state.emit(payload)
+        elif msg_type == "pong":
+            self.pong.emit()
         elif msg_type == "error":
-            append_runtime_log(f"Server error: {payload.get('message')}")
-            self.error.emit(str(payload.get("message") or "Unknown server error"))
+            message = str(payload.get("message") or "Unknown server error")
+            append_runtime_log(f"Server error: {message}")
+            self.error.emit(message)
+            if not self.client_id and self.is_join_rejection(message):
+                self._pending_join_payload = None
+                self.socket.abort()
 
     def _on_error(self, _socket_error: QAbstractSocket.SocketError) -> None:
         self.error.emit(self.socket.errorString())
+
+    @staticmethod
+    def is_join_rejection(message: str) -> bool:
+        lowered = message.strip().lower()
+        return any(fragment in lowered for fragment in ("password", "auth", "join", "first message"))
 
 
 class WindowsRuntimeInstallerWorker(QObject):
@@ -596,9 +620,10 @@ class MainWindow(QMainWindow):
         self.sync_client = SyncClient()
         self.sync_client.room_state.connect(self.on_room_state)
         self.sync_client.info.connect(self.show_status)
-        self.sync_client.error.connect(self.show_error)
+        self.sync_client.error.connect(self.on_sync_client_error)
         self.sync_client.connected.connect(lambda: self.on_connection_change(True))
         self.sync_client.disconnected.connect(lambda: self.on_connection_change(False))
+        self.sync_client.pong.connect(self.on_diagnostics_pong)
 
         self.player = MpvController()
 
@@ -631,6 +656,15 @@ class MainWindow(QMainWindow):
         self.last_applied_event_id = 0
         self.behind_sync_detected_at: float | None = None
         self.player_seen_running_in_room = False
+        self.reconnect_enabled = False
+        self.reconnect_profile: dict[str, object] | None = None
+        self.reconnect_attempt = 0
+        self.user_requested_disconnect = False
+        self.last_connection_error = ""
+        self.last_connected_at = 0.0
+        self.reconnect_status = "idle"
+        self.last_ping_ms: int | None = None
+        self.pending_ping_sent_at: float | None = None
         self._active_threads: list[QThread] = []
         self._active_workers: list[QObject] = []
 
@@ -638,6 +672,13 @@ class MainWindow(QMainWindow):
         self._elide_refresh_pending = False
         self.build_ui()
         self.refresh_scaled_ui(force=True)
+
+        self.reconnect_timer = QTimer(self)
+        self.reconnect_timer.setSingleShot(True)
+        self.reconnect_timer.timeout.connect(self.perform_reconnect)
+        self.diagnostics_timer = QTimer(self)
+        self.diagnostics_timer.setInterval(5000)
+        self.diagnostics_timer.timeout.connect(self.send_diagnostics_ping)
 
         self.heartbeat = QTimer(self)
         self.heartbeat.setInterval(350)
@@ -1167,6 +1208,11 @@ class MainWindow(QMainWindow):
         self.play_button.setObjectName("primaryButton")
         self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.play_button.clicked.connect(self.toggle_playback)
+        self.resync_button = QPushButton("Resync")
+        self.resync_button.setObjectName("ghostButton")
+        self.resync_button.setToolTip("Follow the current room playback state.")
+        self.resync_button.clicked.connect(self.manual_resync_to_room)
+        self.resync_button.setEnabled(False)
         self.position_label = QLabel("00:00")
         self.position_label.setObjectName("timeLabel")
         self.duration_label = QLabel("00:00")
@@ -1177,6 +1223,7 @@ class MainWindow(QMainWindow):
         self.position_slider.sliderReleased.connect(self.on_slider_released)
 
         self.transport_top.addWidget(self.play_button)
+        self.transport_top.addWidget(self.resync_button)
         self.transport_top.addWidget(self.position_label)
         self.transport_top.addWidget(self.position_slider, 1)
         self.transport_top.addWidget(self.duration_label)
@@ -1300,14 +1347,82 @@ class MainWindow(QMainWindow):
         self.audio_action_row.addWidget(self.use_audio_button)
         audio_layout.addLayout(self.audio_action_row)
 
+        diagnostics_card, diagnostics_layout = self.build_panel(
+            "sidebarPanel",
+            margins=(18, 18, 18, 18),
+            spacing=10,
+            glow_color="#101220",
+            glow_alpha=95,
+            blur=24,
+            offset_y=8,
+        )
+
+        diagnostics_overline = QLabel("HEALTH")
+        diagnostics_overline.setObjectName("sectionOverline")
+        diagnostics_title = QLabel("Diagnostics")
+        diagnostics_title.setObjectName("sectionTitle")
+        diagnostics_layout.addWidget(diagnostics_overline)
+        diagnostics_layout.addWidget(diagnostics_title)
+
+        self.diagnostics_connection_value = QLabel("Offline")
+        self.diagnostics_ping_value = QLabel("Unknown")
+        self.diagnostics_drift_value = QLabel("Unknown")
+        self.diagnostics_reconnect_value = QLabel("idle")
+        for label in (
+            self.diagnostics_connection_value,
+            self.diagnostics_ping_value,
+            self.diagnostics_drift_value,
+            self.diagnostics_reconnect_value,
+        ):
+            label.setObjectName("diagnosticValue")
+            self.configure_resizable_label(label, wrap=False)
+        diagnostics_layout.addLayout(
+            self.build_diagnostics_row("Connection", self.diagnostics_connection_value)
+        )
+        diagnostics_layout.addLayout(self.build_diagnostics_row("Ping", self.diagnostics_ping_value))
+        diagnostics_layout.addLayout(self.build_diagnostics_row("Drift", self.diagnostics_drift_value))
+        diagnostics_layout.addLayout(
+            self.build_diagnostics_row("Reconnect", self.diagnostics_reconnect_value)
+        )
+
+        diagnostics_actions = QBoxLayout(QBoxLayout.LeftToRight)
+        diagnostics_actions.setContentsMargins(0, 4, 0, 0)
+        diagnostics_actions.setSpacing(10)
+        self.copy_report_button = QPushButton("Copy Report")
+        self.copy_report_button.setObjectName("ghostButton")
+        self.copy_report_button.setToolTip("Copy connection and player diagnostics to clipboard.")
+        self.copy_report_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.copy_report_button.clicked.connect(self.copy_debug_report)
+        self.open_logs_button = QPushButton("Logs")
+        self.open_logs_button.setObjectName("pillButton")
+        self.open_logs_button.setToolTip("Open the SyncRoom logs folder.")
+        self.open_logs_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.open_logs_button.clicked.connect(self.open_logs_folder)
+        diagnostics_actions.addWidget(self.copy_report_button)
+        diagnostics_actions.addWidget(self.open_logs_button)
+        diagnostics_layout.addLayout(diagnostics_actions)
+
         side_layout.addWidget(top_control_card)
         side_layout.addWidget(audio_card)
+        side_layout.addWidget(diagnostics_card)
         side_layout.addStretch(1)
 
         self.room_shell_layout.addLayout(left_column, 7)
         self.room_shell_layout.addWidget(side_content, 4)
         layout.addLayout(self.room_shell_layout)
         return page
+
+    def build_diagnostics_row(self, title: str, value_label: QLabel) -> QBoxLayout:
+        row = QBoxLayout(QBoxLayout.LeftToRight)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        title_label = QLabel(title)
+        title_label.setObjectName("diagnosticLabel")
+        title_label.setMinimumWidth(78)
+        title_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row.addWidget(title_label)
+        row.addWidget(value_label, 1)
+        return row
 
     def build_field_label(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -1614,6 +1729,14 @@ class MainWindow(QMainWindow):
                 padding: __BADGE_VPAD__px __BADGE_HPAD__px;
                 font-weight: 700;
             }
+            QLabel#reconnectingBadge {
+                background: rgba(34, 31, 24, 0.94);
+                border: 1px solid rgba(146, 132, 96, 0.32);
+                color: #f4eee0;
+                border-radius: __BADGE_RADIUS__px;
+                padding: __BADGE_VPAD__px __BADGE_HPAD__px;
+                font-weight: 700;
+            }
             QLabel#softBadge {
                 background: rgba(20, 20, 21, 0.94);
                 border: 1px solid rgba(78, 78, 82, 0.26);
@@ -1656,6 +1779,16 @@ class MainWindow(QMainWindow):
             QLabel#inlineNote, QLabel#statCaption, QLabel#mediaLabel, QLabel#memberList {
                 color: rgba(168, 168, 174, 0.82);
                 font-size: __NOTE_PX__px;
+            }
+            QLabel#diagnosticLabel {
+                color: rgba(168, 168, 174, 0.82);
+                font-size: __NOTE_PX__px;
+                font-weight: 800;
+            }
+            QLabel#diagnosticValue {
+                color: #f7f7f8;
+                font-size: __NOTE_PX__px;
+                font-weight: 800;
             }
             QLabel#playerHint {
                 color: #ffffff;
@@ -1719,6 +1852,11 @@ class MainWindow(QMainWindow):
             }
             QPushButton:focus {
                 border: 1px solid rgba(184, 184, 190, 0.62);
+            }
+            QPushButton:disabled {
+                color: rgba(148, 148, 152, 0.56);
+                border: 1px solid rgba(64, 64, 68, 0.20);
+                background: rgba(10, 10, 11, 0.58);
             }
             QPushButton#primaryButton {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
@@ -1863,7 +2001,23 @@ class MainWindow(QMainWindow):
             return
         self.persist_settings()
         self.player_seen_running_in_room = False
+        self.reconnect_profile = {
+            "host": host,
+            "port": port,
+            "room": room,
+            "name": name,
+            "password": password,
+        }
+        self.reconnect_enabled = True
+        self.user_requested_disconnect = False
+        self.reconnect_attempt = 0
+        self.reconnect_status = "connecting"
+        self.last_connection_error = ""
+        self.last_ping_ms = None
+        self.pending_ping_sent_at = None
+        self.reconnect_timer.stop()
         self.sync_client.connect_to_server(host, port, room, name, password)
+        self.update_diagnostics()
         self.show_status(f"Connecting to {host}:{port}...")
 
     def selected_host(self) -> str:
@@ -1910,11 +2064,54 @@ class MainWindow(QMainWindow):
         self.update_lobby_summary()
 
     def leave_room(self) -> None:
+        self.user_requested_disconnect = True
+        self.reconnect_enabled = False
+        self.reconnect_status = "idle"
+        self.reconnect_timer.stop()
+        self.diagnostics_timer.stop()
+        self.pending_ping_sent_at = None
         self.sync_client.disconnect_from_server()
         self.player_seen_running_in_room = False
         self.clear_pending_room_sync()
         self.page_stack.setCurrentIndex(0)
+        self.update_diagnostics()
         self.show_status("Left room")
+
+    def manual_resync_to_room(self) -> None:
+        if not self.is_room_connected():
+            self.show_status("Not connected to a room.")
+            return
+        if not self.last_room_payload:
+            self.show_status("No room state received yet.")
+            return
+
+        payload = dict(self.last_room_payload)
+        media_url = str(payload.get("media_url") or "")
+        if media_url and media_url != self.current_media_url:
+            self.url_input.setText(media_url)
+            self.set_media_url(media_url, broadcast=False)
+            self.start_pending_room_sync(payload, "recovering", "Manual resync...")
+            self.show_status("Manual resync started.")
+            return
+
+        if not self.current_media_url:
+            self.show_status("No room media to resync yet.")
+            return
+
+        try:
+            self.apply_server_state(payload, settle_mode=True)
+            self.clear_pending_room_sync()
+            self.update_room_sync_state("live", "Manual resync complete")
+            self.show_status("Resynced to room.")
+        except Exception as exc:
+            append_runtime_log(f"manual_resync_to_room sync exception: {exc}")
+            if self.is_recoverable_sync_error(exc):
+                self.start_pending_room_sync(payload, "recovering", "Manual resync...")
+                self.show_status("Manual resync started.")
+            else:
+                self.show_transient_error(f"Could not resync mpv state: {exc}")
+        finally:
+            self.suppress_sync = False
 
     def load_media_from_input(self) -> None:
         media_url = self.url_input.text().strip()
@@ -2107,6 +2304,9 @@ class MainWindow(QMainWindow):
         elif state == "recovering":
             value = "Syncing"
             caption = note or "catching up to the room"
+        elif state == "reconnecting":
+            value = "Reconnecting"
+            caption = note or "waiting for server"
         elif state == "connected":
             value = "Connected"
             caption = note or "connected to the room"
@@ -2299,6 +2499,7 @@ class MainWindow(QMainWindow):
             )
         self.last_known_playing = playing
         self.remember_polled_state(position, playing, observed_at)
+        self.update_diagnostics()
 
     def on_room_state(self, payload: dict) -> None:
         members = payload.get("members") or []
@@ -2325,6 +2526,7 @@ class MainWindow(QMainWindow):
         position_ms = int(payload.get("position_ms") or 0)
         updated_by = str(payload.get("updated_by") or "")
         self.last_room_payload = dict(payload)
+        self.update_diagnostics()
 
         if not media_url:
             return
@@ -2376,15 +2578,234 @@ class MainWindow(QMainWindow):
     def show_transient_error(self, message: str) -> None:
         self.statusBar().showMessage(message, 5000)
 
-    def on_connection_change(self, connected: bool) -> None:
-        self.update_connection_state(connected)
+    def is_room_connected(self) -> bool:
+        return (
+            bool(self.sync_client.client_id)
+            and self.sync_client.socket.state() == QAbstractSocket.ConnectedState
+        )
+
+    def on_sync_client_error(self, message: str) -> None:
+        message = message.strip() or "Connection error"
+        lowered = message.lower()
+        if self.user_requested_disconnect and any(
+            fragment in lowered for fragment in ("operation canceled", "operation cancelled", "socket operation")
+        ):
+            return
+        self.last_connection_error = message
+        append_runtime_log(f"Sync client error handled: {message}")
+        if SyncClient.is_join_rejection(message):
+            self.reconnect_enabled = False
+            self.user_requested_disconnect = True
+            self.reconnect_status = "stopped"
+            self.reconnect_timer.stop()
+            self.diagnostics_timer.stop()
+            self.update_connection_state(False)
+            self.update_diagnostics()
+            self.show_error(message)
+            return
+
+        if self.reconnect_enabled and not self.user_requested_disconnect and not self.update_in_progress:
+            self.show_transient_error(f"Connection issue: {message}")
+            self.schedule_reconnect()
+            return
+
+        self.show_error(message)
+
+    def schedule_reconnect(self) -> None:
+        if (
+            not self.reconnect_enabled
+            or self.user_requested_disconnect
+            or self.update_in_progress
+            or not self.reconnect_profile
+        ):
+            return
+        if self.reconnect_timer.isActive():
+            return
+        delays_ms = (1000, 2000, 5000, 10000)
+        self.reconnect_attempt += 1
+        delay_ms = delays_ms[self.reconnect_attempt - 1] if self.reconnect_attempt <= len(delays_ms) else 20000
+        delay_seconds = max(1, delay_ms // 1000)
+        self.reconnect_status = f"attempt {self.reconnect_attempt} - next try in {delay_seconds}s"
+        self.update_connection_state(False, reconnecting=True)
+        self.update_room_sync_state("reconnecting", "Connection lost - reconnecting...")
+        self.update_diagnostics()
+        self.show_status("Connection lost - reconnecting...")
+        self.reconnect_timer.start(delay_ms)
+
+    def perform_reconnect(self) -> None:
+        if (
+            not self.reconnect_enabled
+            or self.user_requested_disconnect
+            or self.update_in_progress
+            or not self.reconnect_profile
+        ):
+            return
+        profile = self.reconnect_profile
+        self.reconnect_status = f"attempt {self.reconnect_attempt} - connecting"
+        self.update_connection_state(False, reconnecting=True)
+        self.update_diagnostics()
+        self.show_status(f"Reconnecting... attempt {self.reconnect_attempt}")
+        self.sync_client.connect_to_server(
+            str(profile["host"]),
+            int(profile["port"]),
+            str(profile["room"]),
+            str(profile["name"]),
+            str(profile.get("password") or ""),
+        )
+
+    def send_diagnostics_ping(self) -> None:
+        if not self.is_room_connected():
+            self.pending_ping_sent_at = None
+            self.update_diagnostics()
+            return
+        if self.pending_ping_sent_at is None:
+            self.pending_ping_sent_at = time.monotonic()
+            self.sync_client.send({"type": "ping"})
+        self.update_diagnostics()
+
+    def on_diagnostics_pong(self) -> None:
+        if self.pending_ping_sent_at is None:
+            return
+        self.last_ping_ms = max(0, int((time.monotonic() - self.pending_ping_sent_at) * 1000))
+        self.pending_ping_sent_at = None
+        self.update_diagnostics()
+
+    def update_diagnostics(self) -> None:
+        if not hasattr(self, "diagnostics_connection_value"):
+            return
+        connected = self.is_room_connected()
+        reconnecting = self.reconnect_enabled and (
+            self.reconnect_timer.isActive()
+            or self.sync_client.socket.state() == QAbstractSocket.ConnectingState
+            or self.reconnect_status.startswith("attempt")
+        ) and not connected
         if connected:
+            connection_text = "Connected"
+        elif reconnecting:
+            connection_text = "Reconnecting"
+        else:
+            connection_text = "Offline"
+        self.set_label_text_safe(
+            self.diagnostics_connection_value,
+            connection_text,
+            elide_mode=Qt.ElideRight,
+        )
+        self.set_label_text_safe(
+            self.diagnostics_ping_value,
+            f"{self.last_ping_ms} ms" if self.last_ping_ms is not None else "Unknown",
+            elide_mode=Qt.ElideRight,
+        )
+        self.set_label_text_safe(
+            self.diagnostics_drift_value,
+            self.current_drift_text(),
+            elide_mode=Qt.ElideRight,
+        )
+        self.set_label_text_safe(
+            self.diagnostics_reconnect_value,
+            self.reconnect_status,
+            elide_mode=Qt.ElideRight,
+        )
+        self.resync_button.setEnabled(connected and self.last_room_payload is not None)
+
+    def current_drift_text(self) -> str:
+        if not self.last_room_payload or self.last_polled_position_ms is None:
+            return "Unknown"
+        media_url = str(self.last_room_payload.get("media_url") or "")
+        if not media_url or media_url != self.current_media_url:
+            return "Unknown"
+        drift_ms = int(self.last_polled_position_ms) - int(self.last_room_payload.get("position_ms") or 0)
+        sign = "+" if drift_ms >= 0 else "-"
+        return f"{sign}{abs(drift_ms)} ms"
+
+    def copy_debug_report(self) -> None:
+        log_root = safe_logs_dir()
+        profile = self.reconnect_profile or {}
+        player_status: dict[str, object] = {}
+        try:
+            player_status = self.player.get_status()
+        except Exception as exc:
+            player_status = {"error": str(exc)}
+        payload = self.last_room_payload or {}
+        app_path = Path(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]).resolve()
+        updater_path = app_path.with_name("SyncRoomUpdate.exe")
+        lines = [
+            f"SyncRoom version: {__version__}",
+            f"OS/platform: {platform.platform()}",
+            f"Python version: {platform.python_version()}",
+            f"Frozen: {bool(getattr(sys, 'frozen', False))}",
+            f"App path: {app_path}",
+            f"Executable: {sys.executable}",
+            f"Logs folder: {log_root}",
+            f"runtime.log: {runtime_log_path()}",
+            f"update.log: {update_log_path()}",
+            f"crash.log: {log_root / 'crash.log'}",
+            f"Server: {profile.get('host', self.selected_host())}:{profile.get('port', self.port_input.text().strip() or '24873')}",
+            f"Room: {profile.get('room', self.room_input.text().strip() or 'movie-night')}",
+            f"Display name: {profile.get('name', self.name_input.text().strip() or 'guest')}",
+            f"Connection state: {self.diagnostics_connection_value.text()}",
+            f"Reconnect enabled: {self.reconnect_enabled}",
+            f"Reconnect attempt/status: {self.reconnect_attempt} / {self.reconnect_status}",
+            f"Last connection error: {self.last_connection_error or '<none>'}",
+            f"Room sync: {self.room_sync_state} / {self.room_sync_note or '<none>'}",
+            f"Current media URL: {self.current_media_url or '<none>'}",
+            f"mpv running: {self.player.is_running()}",
+            f"mpv path: {self.player.mpv_path}",
+            f"Player status: {player_status}",
+            f"Last payload event_id: {payload.get('event_id', '<none>')}",
+            f"Last payload seek_token: {payload.get('seek_token', '<none>')}",
+            f"Last payload playing: {payload.get('playing', '<none>')}",
+            f"Last payload media present: {bool(payload.get('media_url'))}",
+            f"Current member count: {self.current_member_count}",
+            f"Windows updater exists: {updater_path.exists() if os.name == 'nt' else 'not Windows'}",
+        ]
+        QApplication.clipboard().setText("\n".join(lines))
+        self.show_status("Debug report copied.")
+
+    def open_logs_folder(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(safe_logs_dir())))
+        self.show_status("Opened logs folder.")
+
+    def on_connection_change(self, connected: bool) -> None:
+        if connected:
+            was_reconnecting = self.reconnect_attempt > 0 or self.reconnect_status.startswith("attempt")
+            self.last_connected_at = time.monotonic()
+            self.reconnect_attempt = 0
+            self.reconnect_status = "idle"
+            self.last_connection_error = ""
+            self.reconnect_timer.stop()
+            if not self.diagnostics_timer.isActive():
+                self.diagnostics_timer.start()
+            self.update_connection_state(True)
             self.closing_for_mpv_exit = False
             self.update_room_sync_state("connected", "waiting for room state")
             self.page_stack.setCurrentIndex(1)
             self.schedule_elide_refresh()
-            self.show_status("Connected to server")
+            self.update_diagnostics()
+            self.send_diagnostics_ping()
+            self.show_status("Reconnected" if was_reconnecting else "Connected to server")
         else:
+            self.diagnostics_timer.stop()
+            self.pending_ping_sent_at = None
+            if (
+                self.reconnect_enabled
+                and not self.user_requested_disconnect
+                and not self.update_in_progress
+                and self.reconnect_profile
+            ):
+                self.current_member_count = 0
+                self.player_seen_running_in_room = False
+                self.set_label_text_safe(self.members_badge, "0 viewers", elide_mode=Qt.ElideRight)
+                self.set_stat_card_text(
+                    self.viewer_stat,
+                    value="0",
+                    caption="reconnecting to room",
+                    caption_elide_mode=Qt.ElideRight,
+                )
+                self.update_connection_state(False, reconnecting=True)
+                self.schedule_reconnect()
+                self.schedule_elide_refresh()
+                return
+            self.update_connection_state(False)
             self.current_member_count = 0
             self.player_seen_running_in_room = False
             self.clear_pending_room_sync()
@@ -2399,6 +2820,7 @@ class MainWindow(QMainWindow):
             )
             self.page_stack.setCurrentIndex(0)
             self.schedule_elide_refresh()
+            self.update_diagnostics()
             self.show_status("Disconnected")
 
     def set_audio_preferences(self, value: str) -> None:
@@ -2713,25 +3135,41 @@ class MainWindow(QMainWindow):
             }
         )
 
-    def update_connection_state(self, connected: bool) -> None:
-        self.connection_badge.setText("CONNECTED" if connected else "OFFLINE")
-        self.connection_badge.setObjectName("onlineBadge" if connected else "offlineBadge")
+    def update_connection_state(self, connected: bool, reconnecting: bool = False) -> None:
+        if connected:
+            badge_text = "CONNECTED"
+            badge_name = "onlineBadge"
+        elif reconnecting:
+            badge_text = "RECONNECTING"
+            badge_name = "reconnectingBadge"
+        else:
+            badge_text = "OFFLINE"
+            badge_name = "offlineBadge"
+        self.connection_badge.setText(badge_text)
+        self.connection_badge.setObjectName(badge_name)
         self.connection_badge.style().unpolish(self.connection_badge)
         self.connection_badge.style().polish(self.connection_badge)
         room_name = self.room_input.text().strip() or "not connected"
         self.set_label_text_safe(
             self.room_badge,
-            f"Room: {room_name if connected else 'not connected'}",
+            f"Room: {room_name if connected or reconnecting else 'not connected'}",
             elide_mode=Qt.ElideRight,
         )
-        self.update_room_sync_state("connected" if connected else "idle")
+        self.update_room_sync_state("connected" if connected else "reconnecting" if reconnecting else "idle")
         self.set_stat_card_text(
             self.room_name_stat,
-            value=room_name if connected else "not connected",
-            caption="share this room name with everyone" if connected else "join a room to begin",
+            value=room_name if connected or reconnecting else "not connected",
+            caption=(
+                "share this room name with everyone"
+                if connected
+                else "trying to restore the room"
+                if reconnecting
+                else "join a room to begin"
+            ),
             value_elide_mode=Qt.ElideMiddle,
         )
         self.schedule_elide_refresh()
+        self.update_diagnostics()
 
 
 def report_startup_crash(exc: BaseException) -> None:
