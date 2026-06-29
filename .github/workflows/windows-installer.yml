@@ -30,14 +30,22 @@ jobs:
       - name: Check version sync
         run: python scripts/check_version_sync.py
 
+      - name: Download Windows media runtime
+        run: python packaging/windows/download_mpv.py packaging/windows
+
       - name: Build app bundle
         run: pyinstaller --clean --noconfirm packaging/syncroom.spec
+
+      - name: Bundle media runtime
+        run: Copy-Item -Path "packaging/windows/runtime/*" -Destination "dist/SyncRoom" -Recurse -Force
 
       - name: Verify app bundle
         run: |
           if (!(Test-Path "dist/SyncRoom/SyncRoom.exe")) { throw "dist/SyncRoom/SyncRoom.exe is missing" }
           if (!(Test-Path "dist/SyncRoom/SyncRoomUpdate.exe")) { throw "dist/SyncRoom/SyncRoomUpdate.exe is missing" }
           if (!(Test-Path "dist/SyncRoom/_internal")) { throw "dist/SyncRoom/_internal is missing" }
+          if (!(Test-Path "dist/SyncRoom/mpv.exe")) { throw "dist/SyncRoom/mpv.exe is missing" }
+          if (!(Test-Path "dist/SyncRoom/yt-dlp.exe")) { throw "dist/SyncRoom/yt-dlp.exe is missing" }
           tree /F dist\SyncRoom
 
       - name: Run updater self-test

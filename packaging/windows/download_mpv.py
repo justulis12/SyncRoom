@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 API_URL = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
+YT_DLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 
 
 def main() -> None:
@@ -64,6 +65,11 @@ def main() -> None:
             shutil.copytree(item, target, dirs_exist_ok=True)
         else:
             shutil.copy2(item, target)
+
+    yt_dlp_path = runtime_dir / "yt-dlp.exe"
+    print(f"Downloading {YT_DLP_URL}")
+    urllib.request.urlretrieve(YT_DLP_URL, yt_dlp_path)
+    print(f"Saved yt-dlp to {yt_dlp_path}")
 
     print(f"Prepared normalized mpv runtime in {runtime_dir}")
 

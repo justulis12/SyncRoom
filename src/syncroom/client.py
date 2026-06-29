@@ -305,6 +305,14 @@ class SyncClient(QObject):
         return any(fragment in lowered for fragment in ("password", "auth", "join", "first message"))
 
 
+class NoWheelComboBox(QComboBox):
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        if self.view().isVisible():
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
 class WindowsRuntimeInstallerWorker(QObject):
     progress = Signal(str, int)
     finished = Signal()
@@ -632,8 +640,10 @@ class MainWindow(QMainWindow):
         self.current_media_url = ""
         self.last_known_playing = False
         self.audio_tracks: list[dict] = []
+        self.subtitle_tracks: list[dict] = []
         self.current_member_count = 0
         self.pending_audio_attempts = 0
+        self.pending_subtitle_attempts = 0
         self.closing_for_mpv_exit = False
         self.pending_room_sync: dict | None = None
         self.pending_room_sync_attempts = 0
@@ -665,6 +675,10 @@ class MainWindow(QMainWindow):
         self.reconnect_status = "idle"
         self.last_ping_ms: int | None = None
         self.pending_ping_sent_at: float | None = None
+        self.custom_host_value = str(self.settings.get("host", "127.0.0.1") or "127.0.0.1")
+        if self.custom_host_value == self.HOSTED_SERVER_URL:
+            self.custom_host_value = "127.0.0.1"
+        self.custom_port_value = str(self.settings.get("port", "24873") or "24873")
         self._active_threads: list[QThread] = []
         self._active_workers: list[QObject] = []
 
@@ -959,12 +973,14 @@ class MainWindow(QMainWindow):
         saved_host_mode = self.settings.get("host_mode", self.HOSTED_SERVER_LABEL)
         if saved_host_mode not in {self.HOSTED_SERVER_LABEL, self.CUSTOM_SERVER_LABEL}:
             saved_host_mode = self.HOSTED_SERVER_LABEL
+        if str(saved_host or "").strip() and saved_host != self.HOSTED_SERVER_URL:
+            self.custom_host_value = str(saved_host)
 
-        self.host_select = QComboBox()
+        self.host_select = NoWheelComboBox()
         self.host_select.addItem(f"{self.HOSTED_SERVER_LABEL} ({self.HOSTED_SERVER_URL})")
         self.host_select.addItem(self.CUSTOM_SERVER_LABEL)
-        self.host_input = QLineEdit(saved_host if saved_host_mode == self.CUSTOM_SERVER_LABEL else self.HOSTED_SERVER_URL)
-        self.port_input = QLineEdit(str(self.settings.get("port", "24873")))
+        self.host_input = QLineEdit(self.custom_host_value if saved_host_mode == self.CUSTOM_SERVER_LABEL else self.HOSTED_SERVER_URL)
+        self.port_input = QLineEdit(self.custom_port_value)
         self.room_input = QLineEdit(self.settings.get("room", "movie-night"))
         self.password_input = QLineEdit(self.settings.get("room_password", ""))
         self.name_input = QLineEdit(self.settings.get("name", default_display_name()))
@@ -977,8 +993,8 @@ class MainWindow(QMainWindow):
         self.name_input.setPlaceholderText("Name")
         self.name_input.returnPressed.connect(self.connect_to_room)
         self.host_select.currentIndexChanged.connect(self.on_host_mode_changed)
-        self.host_input.textChanged.connect(self.update_lobby_summary)
-        self.port_input.textChanged.connect(self.update_lobby_summary)
+        self.host_input.textChanged.connect(self.on_host_input_changed)
+        self.port_input.textChanged.connect(self.on_port_input_changed)
         self.room_input.textChanged.connect(self.update_lobby_summary)
         self.name_input.textChanged.connect(self.update_lobby_summary)
 
@@ -1281,7 +1297,8 @@ class MainWindow(QMainWindow):
         self.load_row.addWidget(self.sync_hint_button)
         top_control_layout.addLayout(self.load_row)
 
-        stream_note = QLabel("Direct stream links only. Playback stays local on each machine.")
+        ytdlp_note = "yt-dlp available" if self.player.yt_dlp_available() else "yt-dlp not found"
+        stream_note = QLabel(f"Direct links work. Web links use yt-dlp when available ({ytdlp_note}).")
         stream_note.setObjectName("inlineNote")
         stream_note.setWordWrap(True)
         top_control_layout.addWidget(stream_note)
@@ -1301,7 +1318,9 @@ class MainWindow(QMainWindow):
         audio_overline = QLabel("TRACKS")
         audio_overline.setObjectName("sectionOverline")
 
-        self.audio_pref_input = QLineEdit(self.settings.get("audio_preferences", "eng,en,english"))
+        self.audio_pref_input = QLineEdit(
+            str(self.settings.get("audio_preferences", "") or "eng,en,english")
+        )
         self.audio_pref_input.setPlaceholderText("Preferred audio")
 
         audio_layout.addWidget(audio_overline)
@@ -1327,7 +1346,7 @@ class MainWindow(QMainWindow):
         self.audio_pref_row.addWidget(self.prefer_japanese_button)
         audio_layout.addLayout(self.audio_pref_row)
 
-        self.audio_track_combo = QComboBox()
+        self.audio_track_combo = NoWheelComboBox()
         self.audio_track_combo.setMinimumWidth(0)
         self.audio_track_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.audio_track_combo.setObjectName("elevatedCombo")
@@ -1346,6 +1365,63 @@ class MainWindow(QMainWindow):
         self.audio_action_row.addWidget(self.refresh_audio_button)
         self.audio_action_row.addWidget(self.use_audio_button)
         audio_layout.addLayout(self.audio_action_row)
+
+        subtitle_card, subtitle_layout = self.build_panel(
+            "sidebarPanel",
+            margins=(20, 20, 20, 20),
+            spacing=12,
+            glow_color="#101220",
+            glow_alpha=105,
+            blur=26,
+            offset_y=9,
+        )
+
+        subtitle_title = QLabel("Subtitles")
+        subtitle_title.setObjectName("sectionTitle")
+        subtitle_overline = QLabel("CAPTIONS")
+        subtitle_overline.setObjectName("sectionOverline")
+        subtitle_layout.addWidget(subtitle_overline)
+        subtitle_layout.addWidget(subtitle_title)
+
+        self.subtitle_pref_combo = NoWheelComboBox()
+        self.subtitle_pref_combo.setObjectName("elevatedCombo")
+        self.subtitle_pref_combo.addItem("Off", "off")
+        self.subtitle_pref_combo.addItem("English", "english")
+        self.subtitle_pref_combo.addItem("English Signs & Songs", "english_signs")
+        self.subtitle_pref_combo.addItem("Custom", "custom")
+        saved_subtitle_mode = str(self.settings.get("subtitle_mode", "off") or "off")
+        saved_index = self.subtitle_pref_combo.findData(saved_subtitle_mode)
+        self.subtitle_pref_combo.setCurrentIndex(max(0, saved_index))
+        self.subtitle_pref_combo.currentIndexChanged.connect(self.on_subtitle_preference_changed)
+        subtitle_layout.addWidget(self.subtitle_pref_combo)
+
+        self.subtitle_custom_input = QLineEdit(
+            str(self.settings.get("subtitle_custom_preferences", "eng,english") or "eng,english")
+        )
+        self.subtitle_custom_input.setPlaceholderText("Custom subtitle match")
+        self.subtitle_custom_input.editingFinished.connect(self.on_subtitle_custom_changed)
+        subtitle_layout.addWidget(self.subtitle_custom_input)
+
+        self.subtitle_track_combo = NoWheelComboBox()
+        self.subtitle_track_combo.setMinimumWidth(0)
+        self.subtitle_track_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.subtitle_track_combo.setObjectName("elevatedCombo")
+        subtitle_layout.addWidget(self.subtitle_track_combo)
+
+        self.subtitle_action_row = QBoxLayout(QBoxLayout.LeftToRight)
+        self.subtitle_action_row.setContentsMargins(0, 0, 0, 0)
+        self.subtitle_action_row.setSpacing(10)
+        self.refresh_subtitle_button = QPushButton("Refresh")
+        self.refresh_subtitle_button.setObjectName("ghostButton")
+        self.refresh_subtitle_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.refresh_subtitle_button.clicked.connect(self.refresh_subtitle_tracks)
+        self.use_subtitle_button = QPushButton("Use Selected")
+        self.use_subtitle_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.use_subtitle_button.clicked.connect(self.use_selected_subtitle_track)
+        self.subtitle_action_row.addWidget(self.refresh_subtitle_button)
+        self.subtitle_action_row.addWidget(self.use_subtitle_button)
+        subtitle_layout.addLayout(self.subtitle_action_row)
+        self.update_subtitle_custom_visibility()
 
         diagnostics_card, diagnostics_layout = self.build_panel(
             "sidebarPanel",
@@ -1366,12 +1442,12 @@ class MainWindow(QMainWindow):
 
         self.diagnostics_connection_value = QLabel("Offline")
         self.diagnostics_ping_value = QLabel("Unknown")
-        self.diagnostics_drift_value = QLabel("Unknown")
+        self.diagnostics_sync_value = QLabel("Unknown")
         self.diagnostics_reconnect_value = QLabel("idle")
         for label in (
             self.diagnostics_connection_value,
             self.diagnostics_ping_value,
-            self.diagnostics_drift_value,
+            self.diagnostics_sync_value,
             self.diagnostics_reconnect_value,
         ):
             label.setObjectName("diagnosticValue")
@@ -1380,7 +1456,7 @@ class MainWindow(QMainWindow):
             self.build_diagnostics_row("Connection", self.diagnostics_connection_value)
         )
         diagnostics_layout.addLayout(self.build_diagnostics_row("Ping", self.diagnostics_ping_value))
-        diagnostics_layout.addLayout(self.build_diagnostics_row("Drift", self.diagnostics_drift_value))
+        diagnostics_layout.addLayout(self.build_diagnostics_row("Sync", self.diagnostics_sync_value))
         diagnostics_layout.addLayout(
             self.build_diagnostics_row("Reconnect", self.diagnostics_reconnect_value)
         )
@@ -1404,6 +1480,7 @@ class MainWindow(QMainWindow):
 
         side_layout.addWidget(top_control_card)
         side_layout.addWidget(audio_card)
+        side_layout.addWidget(subtitle_card)
         side_layout.addWidget(diagnostics_card)
         side_layout.addStretch(1)
 
@@ -1439,29 +1516,47 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.setParent(None)
 
+        hosted = hasattr(self, "host_select") and self.host_select.currentIndex() == 0
         if compact:
-            self.join_grid.addWidget(self.join_host_profile_label, 0, 0)
-            self.join_grid.addWidget(self.host_select, 1, 0)
-            self.join_grid.addWidget(self.join_host_label, 2, 0)
-            self.join_grid.addWidget(self.host_input, 3, 0)
-            self.join_grid.addWidget(self.join_port_label, 4, 0)
-            self.join_grid.addWidget(self.port_input, 5, 0)
-            self.join_grid.addWidget(self.join_room_label, 6, 0)
-            self.join_grid.addWidget(self.room_input, 7, 0)
-            self.join_grid.addWidget(self.join_password_label, 8, 0)
-            self.join_grid.addWidget(self.password_input, 9, 0)
-            self.join_grid.addWidget(self.join_name_label, 10, 0)
-            self.join_grid.addWidget(self.name_input, 11, 0)
+            row = 0
+            self.join_grid.addWidget(self.join_host_profile_label, row, 0)
+            row += 1
+            self.join_grid.addWidget(self.host_select, row, 0)
+            row += 1
+            self.join_grid.addWidget(self.join_host_label, row, 0)
+            row += 1
+            self.join_grid.addWidget(self.host_input, row, 0)
+            row += 1
+            if not hosted:
+                self.join_grid.addWidget(self.join_port_label, row, 0)
+                row += 1
+                self.join_grid.addWidget(self.port_input, row, 0)
+                row += 1
+            self.join_grid.addWidget(self.join_room_label, row, 0)
+            row += 1
+            self.join_grid.addWidget(self.room_input, row, 0)
+            row += 1
+            self.join_grid.addWidget(self.join_password_label, row, 0)
+            row += 1
+            self.join_grid.addWidget(self.password_input, row, 0)
+            row += 1
+            self.join_grid.addWidget(self.join_name_label, row, 0)
+            row += 1
+            self.join_grid.addWidget(self.name_input, row, 0)
             return
 
         self.join_grid.addWidget(self.join_host_profile_label, 0, 0, 1, 2)
         self.join_grid.addWidget(self.host_select, 1, 0, 1, 2)
         self.join_grid.addWidget(self.join_host_label, 2, 0, 1, 2)
         self.join_grid.addWidget(self.host_input, 3, 0, 1, 2)
-        self.join_grid.addWidget(self.join_port_label, 4, 0)
-        self.join_grid.addWidget(self.join_room_label, 4, 1)
-        self.join_grid.addWidget(self.port_input, 5, 0)
-        self.join_grid.addWidget(self.room_input, 5, 1)
+        if hosted:
+            self.join_grid.addWidget(self.join_room_label, 4, 0, 1, 2)
+            self.join_grid.addWidget(self.room_input, 5, 0, 1, 2)
+        else:
+            self.join_grid.addWidget(self.join_port_label, 4, 0)
+            self.join_grid.addWidget(self.join_room_label, 4, 1)
+            self.join_grid.addWidget(self.port_input, 5, 0)
+            self.join_grid.addWidget(self.room_input, 5, 1)
         self.join_grid.addWidget(self.join_password_label, 6, 0, 1, 2)
         self.join_grid.addWidget(self.password_input, 7, 0, 1, 2)
         self.join_grid.addWidget(self.join_name_label, 8, 0, 1, 2)
@@ -1582,6 +1677,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "audio_action_row"):
             self.audio_action_row.setDirection(QBoxLayout.TopToBottom if width < 960 else QBoxLayout.LeftToRight)
             self.audio_action_row.setSpacing(10)
+        if hasattr(self, "subtitle_action_row"):
+            self.subtitle_action_row.setDirection(QBoxLayout.TopToBottom if width < 960 else QBoxLayout.LeftToRight)
+            self.subtitle_action_row.setSpacing(10)
         if hasattr(self, "join_button_row"):
             self.join_button_row.setDirection(QBoxLayout.TopToBottom if width < 760 else QBoxLayout.LeftToRight)
             self.join_button_row.setSpacing(10)
@@ -1995,7 +2093,7 @@ class MainWindow(QMainWindow):
         name = self.name_input.text().strip() or "guest"
         password = self.password_input.text()
         try:
-            port = int(self.port_input.text().strip() or "24873")
+            port = self.selected_port()
         except ValueError:
             self.show_error("Port must be a number.")
             return
@@ -2025,18 +2123,23 @@ class MainWindow(QMainWindow):
             return self.HOSTED_SERVER_URL
         return self.host_input.text().strip() or "127.0.0.1"
 
+    def selected_port(self) -> int:
+        if self.host_select.currentIndex() == 0:
+            return 24873
+        return int(self.port_input.text().strip() or "24873")
+
     def update_lobby_summary(self) -> None:
         if not hasattr(self, "lobby_server_stat"):
             return
         profile = "Hosted" if self.host_select.currentIndex() == 0 else "Custom"
         host = self.selected_host()
-        port = self.port_input.text().strip() or "24873"
+        port = "24873" if self.host_select.currentIndex() == 0 else self.port_input.text().strip() or "24873"
         room = self.room_input.text().strip() or "movie-night"
         name = self.name_input.text().strip() or default_display_name()
         self.set_stat_card_text(
             self.lobby_server_stat,
             value=profile,
-            caption=f"{host}:{port}",
+            caption=host if self.host_select.currentIndex() == 0 else f"{host}:{port}",
             caption_elide_mode=Qt.ElideMiddle,
         )
         self.set_stat_card_text(
@@ -2054,13 +2157,31 @@ class MainWindow(QMainWindow):
 
     def on_host_mode_changed(self) -> None:
         hosted = self.host_select.currentIndex() == 0
-        self.host_input.setEnabled(not hosted)
-        if hosted:
-            self.host_input.setText(self.HOSTED_SERVER_URL)
+        if not hosted:
+            self.host_input.setText(self.custom_host_value)
+            self.port_input.setText(self.custom_port_value)
         else:
-            if self.host_input.text().strip() == self.HOSTED_SERVER_URL:
-                custom_saved = str(self.settings.get("host", "127.0.0.1"))
-                self.host_input.setText(custom_saved if custom_saved != self.HOSTED_SERVER_URL else "127.0.0.1")
+            current_host = self.host_input.text().strip()
+            if current_host and current_host != self.HOSTED_SERVER_URL:
+                self.custom_host_value = current_host
+            self.custom_port_value = self.port_input.text().strip() or self.custom_port_value
+            self.host_input.setText(self.HOSTED_SERVER_URL)
+        self.host_input.setEnabled(not hosted)
+        self.join_port_label.setVisible(not hosted)
+        self.port_input.setVisible(not hosted)
+        if hasattr(self, "join_grid"):
+            compact = bool(self.join_grid.property("compact"))
+            self.rebuild_join_grid(compact)
+        self.update_lobby_summary()
+
+    def on_host_input_changed(self) -> None:
+        if self.host_select.currentIndex() == 1:
+            self.custom_host_value = self.host_input.text().strip()
+        self.update_lobby_summary()
+
+    def on_port_input_changed(self) -> None:
+        if self.host_select.currentIndex() == 1:
+            self.custom_port_value = self.port_input.text().strip()
         self.update_lobby_summary()
 
     def leave_room(self) -> None:
@@ -2151,14 +2272,20 @@ class MainWindow(QMainWindow):
             if not broadcast:
                 self.update_room_sync_state("loading", "Waiting for stream...")
             self.pending_audio_attempts = 10
+            self.pending_subtitle_attempts = 10
             self.show_status("Loaded video link in mpv")
             QTimer.singleShot(250, self.refresh_audio_tracks)
             QTimer.singleShot(450, self.apply_audio_preferences_with_retry)
+            QTimer.singleShot(300, self.refresh_subtitle_tracks)
+            QTimer.singleShot(500, self.apply_subtitle_preferences_with_retry)
             self.persist_settings()
         except Exception as exc:
             append_runtime_log(f"set_media_url failed: {exc}")
+            hint = ""
+            if not self.player.yt_dlp_available():
+                hint = " This link may require yt-dlp. Direct video links still work."
             self.show_error(
-                f"Could not start mpv. SyncRoom could not launch or install the player runtime. Details: {exc}"
+                f"Could not start mpv. SyncRoom could not launch or install the player runtime. Details: {exc}{hint}"
             )
         finally:
             self.suppress_sync = False
@@ -2313,6 +2440,7 @@ class MainWindow(QMainWindow):
 
         self.set_stat_card_text(self.room_status_card, value=value, caption=caption)
         self.schedule_elide_refresh()
+        self.update_diagnostics()
 
     def schedule_pending_room_sync(self, delay_ms: int | None = None) -> None:
         if self.pending_room_sync is None or self._pending_sync_retry_scheduled:
@@ -2499,7 +2627,6 @@ class MainWindow(QMainWindow):
             )
         self.last_known_playing = playing
         self.remember_polled_state(position, playing, observed_at)
-        self.update_diagnostics()
 
     def on_room_state(self, payload: dict) -> None:
         members = payload.get("members") or []
@@ -2696,8 +2823,8 @@ class MainWindow(QMainWindow):
             elide_mode=Qt.ElideRight,
         )
         self.set_label_text_safe(
-            self.diagnostics_drift_value,
-            self.current_drift_text(),
+            self.diagnostics_sync_value,
+            self.diagnostics_sync_text(),
             elide_mode=Qt.ElideRight,
         )
         self.set_label_text_safe(
@@ -2716,6 +2843,17 @@ class MainWindow(QMainWindow):
         drift_ms = int(self.last_polled_position_ms) - int(self.last_room_payload.get("position_ms") or 0)
         sign = "+" if drift_ms >= 0 else "-"
         return f"{sign}{abs(drift_ms)} ms"
+
+    def diagnostics_sync_text(self) -> str:
+        if self.room_sync_state == "live":
+            return "Live"
+        if self.room_sync_state == "recovering":
+            return "Syncing"
+        if self.room_sync_state == "reconnecting":
+            return "Reconnecting"
+        if self.room_sync_state == "connected":
+            return "Connected"
+        return "Unknown"
 
     def copy_debug_report(self) -> None:
         log_root = safe_logs_dir()
@@ -2747,9 +2885,12 @@ class MainWindow(QMainWindow):
             f"Reconnect attempt/status: {self.reconnect_attempt} / {self.reconnect_status}",
             f"Last connection error: {self.last_connection_error or '<none>'}",
             f"Room sync: {self.room_sync_state} / {self.room_sync_note or '<none>'}",
+            f"Approx drift: {self.current_drift_text()}",
             f"Current media URL: {self.current_media_url or '<none>'}",
             f"mpv running: {self.player.is_running()}",
             f"mpv path: {self.player.mpv_path}",
+            f"yt-dlp available: {self.player.yt_dlp_available()}",
+            f"yt-dlp path: {self.player.yt_dlp_path() or '<none>'}",
             f"Player status: {player_status}",
             f"Last payload event_id: {payload.get('event_id', '<none>')}",
             f"Last payload seek_token: {payload.get('seek_token', '<none>')}",
@@ -2840,10 +2981,14 @@ class MainWindow(QMainWindow):
         if self.pending_audio_attempts > 0 and self.current_media_url:
             self.pending_audio_attempts -= 1
             QTimer.singleShot(450, self.apply_audio_preferences_with_retry)
+        elif self.current_media_url:
+            self.refresh_audio_tracks(silent=True)
 
     def apply_audio_preferences(self) -> bool:
         preferences = [
-            item.strip() for item in self.audio_pref_input.text().split(",") if item.strip()
+            item.strip()
+            for item in (self.audio_pref_input.text().strip() or "eng,en,english").split(",")
+            if item.strip()
         ]
         if not preferences or not self.current_media_url:
             return False
@@ -2861,6 +3006,66 @@ class MainWindow(QMainWindow):
             self.show_status(f"Using audio track: {label}")
             self.persist_settings()
             return True
+        return False
+
+    def update_subtitle_custom_visibility(self) -> None:
+        if not hasattr(self, "subtitle_custom_input"):
+            return
+        custom = self.subtitle_pref_combo.currentData() == "custom"
+        self.subtitle_custom_input.setVisible(custom)
+        self.subtitle_custom_input.setEnabled(custom)
+
+    def on_subtitle_preference_changed(self) -> None:
+        self.update_subtitle_custom_visibility()
+        self.pending_subtitle_attempts = 10
+        self.apply_subtitle_preferences_with_retry()
+        self.refresh_subtitle_tracks(silent=True)
+        self.persist_settings()
+
+    def on_subtitle_custom_changed(self) -> None:
+        if self.subtitle_pref_combo.currentData() == "custom":
+            self.pending_subtitle_attempts = 10
+            self.apply_subtitle_preferences_with_retry()
+        self.persist_settings()
+
+    def subtitle_preferences(self) -> list[str]:
+        return [
+            item.strip()
+            for item in self.subtitle_custom_input.text().split(",")
+            if item.strip()
+        ]
+
+    def apply_subtitle_preferences_with_retry(self) -> None:
+        self.refresh_subtitle_tracks(silent=True)
+        applied = self.apply_subtitle_preferences()
+        if applied:
+            self.pending_subtitle_attempts = 0
+            QTimer.singleShot(300, self.refresh_subtitle_tracks)
+            return
+        if self.pending_subtitle_attempts > 0 and self.current_media_url:
+            self.pending_subtitle_attempts -= 1
+            QTimer.singleShot(450, self.apply_subtitle_preferences_with_retry)
+        elif self.current_media_url:
+            self.refresh_subtitle_tracks(silent=True)
+
+    def apply_subtitle_preferences(self) -> bool:
+        if not self.current_media_url:
+            return False
+        mode = str(self.subtitle_pref_combo.currentData() or "off")
+        try:
+            if mode == "off":
+                self.player.disable_subtitles()
+                return True
+            track = self.player.select_best_subtitle(mode, self.subtitle_preferences())
+        except Exception as exc:
+            append_runtime_log(f"apply_subtitle_preferences failed: {exc}")
+            return False
+        if track:
+            self.show_status(f"Using subtitle track: {self.player.describe_subtitle_track(track)}")
+            self.persist_settings()
+            return True
+        if mode == "english_signs" and self.pending_subtitle_attempts <= 0:
+            self.show_status("No English Signs & Songs subtitle track found.")
         return False
 
     def refresh_audio_tracks(self, silent: bool = False) -> None:
@@ -2899,6 +3104,43 @@ class MainWindow(QMainWindow):
             self.show_status("Switched audio track")
         except Exception as exc:
             self.show_error(f"Could not switch audio track: {exc}")
+
+    def refresh_subtitle_tracks(self, silent: bool = False) -> None:
+        self.subtitle_track_combo.clear()
+        if not self.current_media_url:
+            self.subtitle_track_combo.addItem("No media loaded", None)
+            return
+        try:
+            self.subtitle_tracks = self.player.list_subtitle_tracks()
+        except Exception as exc:
+            self.subtitle_track_combo.addItem("Could not read subtitles", None)
+            if not silent:
+                self.show_transient_error(f"Could not read subtitle tracks: {exc}")
+            return
+        if not self.subtitle_tracks:
+            self.subtitle_track_combo.addItem("No subtitle tracks found", None)
+            return
+        selected_index = 0
+        for track in self.subtitle_tracks:
+            suffix = " [selected]" if track.get("selected") else ""
+            self.subtitle_track_combo.addItem(
+                f"{self.player.describe_subtitle_track(track)}{suffix}",
+                int(track["id"]),
+            )
+            if track.get("selected"):
+                selected_index = self.subtitle_track_combo.count() - 1
+        self.subtitle_track_combo.setCurrentIndex(selected_index)
+
+    def use_selected_subtitle_track(self) -> None:
+        track_id = self.subtitle_track_combo.currentData()
+        if track_id is None:
+            return
+        try:
+            self.player.set_subtitle_track(int(track_id))
+            QTimer.singleShot(300, self.refresh_subtitle_tracks)
+            self.show_status("Switched subtitle track")
+        except Exception as exc:
+            self.show_error(f"Could not switch subtitle track: {exc}")
 
     @staticmethod
     def describe_audio_track(track: dict) -> str:
@@ -3125,13 +3367,15 @@ class MainWindow(QMainWindow):
     def persist_settings(self) -> None:
         save_settings(
             {
-                "host": self.host_input.text().strip(),
+                "host": self.custom_host_value.strip() or "127.0.0.1",
                 "host_mode": self.CUSTOM_SERVER_LABEL if self.host_select.currentIndex() == 1 else self.HOSTED_SERVER_LABEL,
-                "port": self.port_input.text().strip(),
+                "port": self.custom_port_value.strip() or "24873",
                 "room": self.room_input.text().strip(),
                 "room_password": self.password_input.text(),
                 "name": self.name_input.text().strip(),
-                "audio_preferences": self.audio_pref_input.text().strip(),
+                "audio_preferences": self.audio_pref_input.text().strip() or "eng,en,english",
+                "subtitle_mode": str(self.subtitle_pref_combo.currentData() or "off") if hasattr(self, "subtitle_pref_combo") else "off",
+                "subtitle_custom_preferences": self.subtitle_custom_input.text().strip() if hasattr(self, "subtitle_custom_input") else "eng,english",
             }
         )
 

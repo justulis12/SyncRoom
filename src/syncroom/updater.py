@@ -883,7 +883,11 @@ def run_with_ui(worker_callback: Callable[[ProgressCallback], int], version: str
         thread.quit()
         if exit_code == 0:
             window.set_progress("Done", "SyncRoom has been updated.", 100)
-            QTimer.singleShot(900, app.quit)
+            def close_success() -> None:
+                window.close()
+                app.exit(0)
+
+            QTimer.singleShot(1800, close_success)
         else:
             window.show_failure(f"Updater exited with code {exit_code}.")
 

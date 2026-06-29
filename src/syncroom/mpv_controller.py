@@ -24,6 +24,9 @@ class MpvController:
         {"eng", "en", "english"},
         {"jp", "jpn", "ja", "jap", "japanese"},
     ]
+    ENGLISH_ALIASES = {"eng", "en", "english"}
+    SIGNS_SONGS_TOKENS = {"sign", "signs", "song", "songs", "forced", "ss", "signssongs"}
+    NON_FULL_SUBTITLE_TOKENS = SIGNS_SONGS_TOKENS | {"sdh", "commentary", "comments"}
 
     def __init__(self) -> None:
         self.process: subprocess.Popen[bytes] | None = None
@@ -60,6 +63,29 @@ class MpvController:
         discovered = shutil.which("mpv")
         return discovered or "mpv"
 
+    def yt_dlp_path(self) -> str:
+        candidates: list[Path] = []
+        exe_dir = Path(sys.executable).resolve().parent
+        mpv_path = Path(self.mpv_path)
+        candidates.append(exe_dir / "yt-dlp.exe")
+        candidates.append(exe_dir / "yt-dlp")
+        if mpv_path.parent:
+            candidates.append(mpv_path.parent / "yt-dlp.exe")
+            candidates.append(mpv_path.parent / "yt-dlp")
+            candidates.append(mpv_path.parent / "runtime" / "yt-dlp.exe")
+        if os.name == "nt":
+            candidates.append(windows_runtime_mpv_path().parent / "yt-dlp.exe")
+
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+
+        discovered = shutil.which("yt-dlp")
+        return discovered or ""
+
+    def yt_dlp_available(self) -> bool:
+        return bool(self.yt_dlp_path())
+
     def _build_ipc_path(self) -> str:
         token = f"syncroom-{uuid.uuid4().hex}"
         if os.name == "nt":
@@ -86,6 +112,14 @@ class MpvController:
             "--title=SyncRoom Player",
             "--profile=sw-fast",
         ]
+        ytdlp_path = self.yt_dlp_path()
+        if ytdlp_path:
+            command.extend(
+                [
+                    "--ytdl=yes",
+                    f"--script-opts-append=ytdl_hook-ytdl_path={ytdlp_path}",
+                ]
+            )
         try:
             self.process = subprocess.Popen(
                 command,
@@ -141,6 +175,29 @@ class MpvController:
     def set_audio_track(self, track_id: int) -> None:
         self.command(["set_property", "aid", int(track_id)])
 
+    def list_subtitle_tracks(self) -> list[dict[str, Any]]:
+        track_list = self.get_property("track-list", [])
+        subtitle_tracks: list[dict[str, Any]] = []
+        for track in track_list or []:
+            if track.get("type") != "sub":
+                continue
+            subtitle_tracks.append(
+                {
+                    "id": int(track.get("id") or 0),
+                    "title": str(track.get("title") or ""),
+                    "lang": str(track.get("lang") or ""),
+                    "codec": str(track.get("codec") or ""),
+                    "selected": bool(track.get("selected")),
+                }
+            )
+        return subtitle_tracks
+
+    def set_subtitle_track(self, track_id: int) -> None:
+        self.command(["set_property", "sid", int(track_id)])
+
+    def disable_subtitles(self) -> None:
+        self.command(["set_property", "sid", "no"])
+
     def select_best_audio(self, preferences: list[str]) -> dict[str, Any] | None:
         tracks = self.list_audio_tracks()
         if not tracks:
@@ -169,6 +226,54 @@ class MpvController:
                 if self.track_matches_preference(track, preference):
                     return track
         return None
+
+    def select_best_subtitle(
+        self,
+        mode: str,
+        preferences: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        mode = mode.strip().lower()
+        if mode == "off":
+            self.disable_subtitles()
+            return None
+
+        tracks = self.list_subtitle_tracks()
+        if not tracks:
+            return None
+
+        chosen: dict[str, Any] | None = None
+        if mode == "english":
+            english_tracks = [track for track in tracks if self.subtitle_is_english(track)]
+            clean_tracks = [
+                track
+                for track in english_tracks
+                if not self.subtitle_has_any_token(track, self.NON_FULL_SUBTITLE_TOKENS)
+            ]
+            chosen = clean_tracks[0] if clean_tracks else english_tracks[0] if len(english_tracks) == 1 else None
+        elif mode == "english_signs":
+            chosen = next(
+                (
+                    track
+                    for track in tracks
+                    if self.subtitle_is_english(track)
+                    and self.subtitle_has_any_token(track, self.SIGNS_SONGS_TOKENS)
+                ),
+                None,
+            )
+        elif mode == "custom":
+            normalized_preferences = self._expand_preferences(preferences or [])
+            for preference in normalized_preferences:
+                chosen = next(
+                    (track for track in tracks if self.track_matches_preference(track, preference)),
+                    None,
+                )
+                if chosen is not None:
+                    break
+
+        if chosen is None:
+            return None
+        self.set_subtitle_track(int(chosen["id"]))
+        return chosen
 
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
@@ -312,6 +417,36 @@ class MpvController:
             ]
         ).strip()
         return bool(haystack and preference in haystack)
+
+    @classmethod
+    def subtitle_is_english(cls, track: dict[str, Any]) -> bool:
+        lang = cls._normalize_token(str(track.get("lang") or ""))
+        title = cls._normalize_token(str(track.get("title") or ""))
+        return any(
+            alias in {lang, title}
+            or lang.startswith(alias)
+            or alias in title
+            for alias in cls.ENGLISH_ALIASES
+        )
+
+    @classmethod
+    def subtitle_has_any_token(cls, track: dict[str, Any], tokens: set[str]) -> bool:
+        haystack = " ".join(
+            [
+                cls._normalize_token(str(track.get("title") or "")),
+                cls._normalize_token(str(track.get("lang") or "")),
+                cls._normalize_token(str(track.get("codec") or "")),
+            ]
+        )
+        return any(token in haystack for token in tokens)
+
+    @staticmethod
+    def describe_subtitle_track(track: dict[str, Any]) -> str:
+        lang = str(track.get("lang") or "unknown")
+        title = str(track.get("title") or "").strip()
+        if title:
+            return f"{lang} - {title}"
+        return lang
 
 
 class contextlib_suppress:
