@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import platform
-import shutil
 import subprocess
 import sys
 import time
@@ -36,10 +35,13 @@ from PySide6.QtWidgets import (
 )
 
 from syncroom import __version__
+from syncroom.client_media import ClientMediaMixin
+from syncroom.client_media_tools import ClientMediaToolsMixin
+from syncroom.client_osd import ClientOsdMixin
 from syncroom.mpv_controller import MpvController
 from syncroom.network.sync_client import SyncClient
 from syncroom.settings import app_config_dir, default_display_name, load_settings, save_settings
-from syncroom.ui.dialogs import ProgressScreenDialog, StartupSetupDialog, UpdateAvailableDialog
+from syncroom.ui.dialogs import StartupSetupDialog, UpdateAvailableDialog
 from syncroom.ui.settings_panel import SettingsPanel
 from syncroom.ui.widgets import GradientWordmarkLabel, NoWheelComboBox
 from syncroom.updates import (
@@ -58,11 +60,7 @@ from syncroom.utils.logging import (
 from syncroom.utils.paths import app_icon_path
 from syncroom.windows_runtime import (
     ensure_windows_media_runtime,
-    ensure_windows_mpv_runtime,
     mpv_version,
-    needs_yt_dlp_update,
-    update_windows_yt_dlp_runtime,
-    windows_runtime_root,
     windows_mpv_available,
     windows_runtime_mpv_path,
     windows_runtime_yt_dlp_path,
@@ -138,42 +136,6 @@ class UpdateCheckWorker(QObject):
 
     def run(self) -> None:
         self.finished.emit(check_for_updates())
-
-
-class MediaToolsWorker(QObject):
-    progress = Signal(str, int)
-    finished = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, action: str) -> None:
-        super().__init__()
-        self.action = action
-
-    def run(self) -> None:
-        try:
-            if self.action == "repair_mpv":
-                if os.name != "nt":
-                    raise RuntimeError("mpv is managed by your Linux package manager.")
-                path = ensure_windows_mpv_runtime(self._report)
-                self.finished.emit({"action": self.action, "path": str(path), "message": "mpv repaired."})
-                return
-            if self.action == "update_yt_dlp":
-                path = update_windows_yt_dlp_runtime(self._report)
-                self.finished.emit({"action": self.action, "path": str(path), "message": "yt-dlp updated."})
-                return
-            if self.action == "auto_yt_dlp":
-                if os.name == "nt" and needs_yt_dlp_update():
-                    path = update_windows_yt_dlp_runtime(self._report)
-                    self.finished.emit({"action": self.action, "path": str(path), "message": "yt-dlp updated."})
-                    return
-                self.finished.emit({"action": self.action, "path": "", "message": "yt-dlp already up to date."})
-                return
-            raise RuntimeError(f"Unknown media tools action: {self.action}")
-        except Exception as exc:
-            self.failed.emit(str(exc))
-
-    def _report(self, message: str, percent: int) -> None:
-        self.progress.emit(message, percent)
 
 
 def prepare_windows_runtime_if_needed() -> bool:
@@ -262,7 +224,7 @@ def prepare_windows_runtime_if_needed() -> bool:
     return False
 
 
-class MainWindow(QMainWindow):
+class MainWindow(QMainWindow, ClientMediaMixin, ClientMediaToolsMixin, ClientOsdMixin):
     PAUSED_SYNC_THRESHOLD_MS = 250
     PLAYING_REWIND_THRESHOLD_MS = 1400
     PLAYING_FASTFORWARD_THRESHOLD_MS = 1800
@@ -270,6 +232,11 @@ class MainWindow(QMainWindow):
     LOCAL_PLAYING_SEEK_THRESHOLD_MS = 1200
     LOCAL_PAUSED_SEEK_THRESHOLD_MS = 350
     SYNC_RETRY_INTERVAL_MS = 450
+    MAX_PENDING_SYNC_ATTEMPTS = 18
+    ONLINE_MEDIA_CONFIRM_DELAY_SECONDS = 1.2
+    SMOOTH_SYNC_MIN_DRIFT_MS = 150
+    HARD_SYNC_DRIFT_MS = 750
+    HARD_SYNC_COOLDOWN_SECONDS = 1.2
     HOSTED_SERVER_LABEL = "Hosted server"
     CUSTOM_SERVER_LABEL = "Custom host"
     HOSTED_SERVER_URL = "syncroom1.justys.xyz"
@@ -317,12 +284,19 @@ class MainWindow(QMainWindow):
         self.last_polled_position_ms: int | None = None
         self.last_polled_playing: bool | None = None
         self.last_poll_monotonic: float | None = None
+        self.media_load_generation = 0
+        self.media_switch_in_progress = False
+        self.loading_media_url = ""
+        self.media_loaded_confirmed = False
+        self.media_switch_started_at = 0.0
+        self.previous_mpv_media_url = ""
         self.pending_update_info: UpdateInfo | None = None
         self.update_check_started = False
         self.update_prompted_version = ""
         self.update_in_progress = False
         self.last_applied_seek_token = 0
         self.last_applied_event_id = 0
+        self.last_accepted_event_id = 0
         self.last_osd_event_id = 0
         self.last_osd_signature = ""
         self.last_local_osd_signature = ""
@@ -338,7 +312,14 @@ class MainWindow(QMainWindow):
         self.last_connected_at = 0.0
         self.reconnect_status = "idle"
         self.last_ping_ms: int | None = None
+        self.estimated_rtt_ms: float | None = None
+        self.estimated_one_way_ms = 0.0
         self.pending_ping_sent_at: float | None = None
+        self.last_expected_room_position_ms: int | None = None
+        self.last_sync_drift_ms: int | None = None
+        self.last_sync_correction_reason = "none"
+        self.last_hard_sync_correction_at = 0.0
+        self.smooth_sync_correction_active = False
         self.yt_dlp_last_check = float(self.settings.get("yt_dlp_last_check", 0) or 0)
         self.yt_dlp_last_status = ""
         self.media_load_watchdog_token = 0
@@ -401,6 +382,7 @@ class MainWindow(QMainWindow):
         self.page_stack.addWidget(self.make_scroll_page(self.build_join_page()))
         self.page_stack.addWidget(self.make_scroll_page(self.build_room_page()))
         self.settings_panel = SettingsPanel(self.settings)
+        self.settings_panel.configure_media_tools_platform(os.name == "nt", self.linux_media_tools_hint())
         self.settings_panel.audioPreferenceChanged.connect(self.on_audio_preference_changed)
         self.settings_panel.subtitlePreferenceChanged.connect(self.on_subtitle_preference_changed)
         self.settings_panel.streamingQualityChanged.connect(self.on_streaming_quality_changed)
@@ -488,9 +470,9 @@ class MainWindow(QMainWindow):
 
         nav_capsule = QFrame()
         nav_capsule.setObjectName("navCapsule")
-        nav_layout = QHBoxLayout(nav_capsule)
-        nav_layout.setContentsMargins(8, 8, 8, 8)
-        nav_layout.setSpacing(8)
+        self.nav_capsule_layout = QHBoxLayout(nav_capsule)
+        self.nav_capsule_layout.setContentsMargins(8, 8, 8, 8)
+        self.nav_capsule_layout.setSpacing(8)
         self.lobby_nav_chip = self.build_nav_chip("Lobby")
         self.room_nav_chip = self.build_nav_chip("Room")
         self.settings_nav_chip = self.build_nav_chip("Settings")
@@ -498,7 +480,7 @@ class MainWindow(QMainWindow):
         self.room_nav_chip.clicked.connect(lambda: self.page_stack.setCurrentIndex(1))
         self.settings_nav_chip.clicked.connect(lambda: self.page_stack.setCurrentIndex(2))
         for chip in (self.lobby_nav_chip, self.room_nav_chip, self.settings_nav_chip):
-            nav_layout.addWidget(chip)
+            self.nav_capsule_layout.addWidget(chip)
 
         self.brand_wordmark = GradientWordmarkLabel("SyncRoom")
 
@@ -1243,10 +1225,22 @@ class MainWindow(QMainWindow):
                 self.rebuild_join_grid(compact_join)
 
         if hasattr(self, "top_bar_row"):
-            self.top_bar_row.setSpacing(10 if room_compact else 12)
+            self.top_bar_row.setSpacing(6 if width < 760 else 8 if room_compact else 12)
+        if hasattr(self, "nav_capsule_layout"):
+            nav_pad = 5 if width < 760 else 6 if room_compact else 8
+            self.nav_capsule_layout.setContentsMargins(nav_pad, nav_pad, nav_pad, nav_pad)
+            self.nav_capsule_layout.setSpacing(5 if width < 760 else 6 if room_compact else 8)
         if hasattr(self, "brand_wordmark"):
-            self.brand_wordmark.setVisible(width >= 820)
-            self.brand_wordmark.set_pixel_size(max(20, round(24 * self.compute_ui_scale())))
+            if width >= 980:
+                wordmark_px = round(24 * self.compute_ui_scale())
+            elif width >= 860:
+                wordmark_px = 21
+            elif width >= 760:
+                wordmark_px = 18
+            else:
+                wordmark_px = 15
+            self.brand_wordmark.setVisible(width >= 700)
+            self.brand_wordmark.set_pixel_size(wordmark_px)
         if hasattr(self, "join_shell_layout"):
             self.join_shell_layout.setDirection(QBoxLayout.TopToBottom)
             self.join_shell_layout.setSpacing(12 if room_compact else 14)
@@ -1730,6 +1724,17 @@ class MainWindow(QMainWindow):
         self.last_connection_error = ""
         self.last_ping_ms = None
         self.pending_ping_sent_at = None
+        self.last_room_payload = None
+        self.last_applied_event_id = 0
+        self.last_accepted_event_id = 0
+        self.last_applied_seek_token = 0
+        self.last_osd_event_id = 0
+        self.last_osd_signature = ""
+        self.last_expected_room_position_ms = None
+        self.last_sync_drift_ms = None
+        self.last_sync_correction_reason = "none"
+        self.last_hard_sync_correction_at = 0.0
+        self.smooth_sync_correction_active = False
         self.reconnect_timer.stop()
         self.sync_client.connect_to_server(host, port, room, name, password)
         self.update_diagnostics()
@@ -1811,6 +1816,17 @@ class MainWindow(QMainWindow):
         self.sync_client.disconnect_from_server()
         self.player_seen_running_in_room = False
         self.clear_pending_room_sync()
+        self.last_room_payload = None
+        self.last_applied_event_id = 0
+        self.last_accepted_event_id = 0
+        self.last_applied_seek_token = 0
+        self.last_osd_event_id = 0
+        self.last_osd_signature = ""
+        self.last_expected_room_position_ms = None
+        self.last_sync_drift_ms = None
+        self.last_sync_correction_reason = "none"
+        self.last_hard_sync_correction_at = 0.0
+        self.smooth_sync_correction_active = False
         self.page_stack.setCurrentIndex(0)
         self.update_diagnostics()
         self.show_status("Left room")
@@ -1863,124 +1879,6 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(room_name)
         self.show_status(f"Copied room name: {room_name}")
 
-    def set_media_url(self, media_url: str, broadcast: bool) -> None:
-        previous_media_url = self.current_media_url
-        if media_url != previous_media_url:
-            self.fallback_prompt_seen.clear()
-        self.current_media_url = media_url
-        self.set_label_text_safe(
-            self.current_media_label,
-            media_url or "No media loaded yet",
-            elide_mode=Qt.ElideMiddle,
-        )
-        append_runtime_log(f"Loading media broadcast={broadcast}")
-        loaded = False
-        try:
-            self.suppress_sync = True
-            if os.name == "nt" and self.player.needs_windows_mpv_runtime_install():
-                self.show_status("First-time setup: downloading mpv for Windows...")
-            self.player.load(media_url)
-            loaded = True
-            self.position_slider.setRange(0, 0)
-            self.position_slider.setValue(0)
-            self.position_label.setText("00:00")
-            self.duration_label.setText("00:00")
-            self.last_known_playing = False
-            self.behind_sync_detected_at = None
-            self.player_seen_running_in_room = False
-            self.last_polled_position_ms = None
-            self.last_polled_playing = None
-            self.last_poll_monotonic = None
-            if not broadcast:
-                self.update_room_sync_state("loading", "Waiting for stream...")
-            self.pending_audio_attempts = 10
-            self.pending_subtitle_attempts = 10
-            self.show_status("Loaded video link in mpv")
-            if broadcast:
-                self.show_local_playback_osd("load", 0)
-            QTimer.singleShot(250, self.refresh_audio_tracks)
-            QTimer.singleShot(450, self.apply_audio_preferences_with_retry)
-            QTimer.singleShot(300, self.refresh_subtitle_tracks)
-            QTimer.singleShot(500, self.apply_subtitle_preferences_with_retry)
-            self.start_media_load_watchdog(media_url)
-            self.persist_settings()
-        except Exception as exc:
-            append_runtime_log(f"set_media_url failed: {exc}")
-            hint = ""
-            if not self.player.yt_dlp_available():
-                hint = " This link may require yt-dlp. Direct video links still work."
-            self.show_error(
-                f"Could not start mpv. SyncRoom could not launch or install the player runtime. Details: {exc}{hint}"
-            )
-        finally:
-            self.suppress_sync = False
-        if broadcast and loaded:
-            self.sync_client.send_state(self.current_media_url, 0, False, reason="load")
-
-    def is_online_media_url(self, media_url: str) -> bool:
-        return media_url.strip().lower().startswith(("http://", "https://"))
-
-    def lower_streaming_quality(self, quality: str) -> str:
-        order = ["360p", "480p", "720p", "1080p", "4k"]
-        try:
-            index = order.index(quality)
-        except ValueError:
-            return ""
-        if index <= 0:
-            return ""
-        return order[index - 1]
-
-    def start_media_load_watchdog(self, media_url: str) -> None:
-        if not self.is_online_media_url(media_url):
-            return
-        quality = self.settings_panel.streaming_quality()
-        if not self.lower_streaming_quality(quality):
-            return
-        self.media_load_watchdog_token += 1
-        token = self.media_load_watchdog_token
-        QTimer.singleShot(15000, lambda: self.check_media_load_watchdog(token, media_url, quality))
-
-    def check_media_load_watchdog(self, token: int, media_url: str, quality: str) -> None:
-        if token != self.media_load_watchdog_token or media_url != self.current_media_url:
-            return
-        if (media_url, quality) in self.fallback_prompt_seen:
-            return
-        if self.media_is_ready(media_url):
-            return
-        lower_quality = self.lower_streaming_quality(quality)
-        if not lower_quality:
-            return
-        self.fallback_prompt_seen.add((media_url, quality))
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("SyncRoom")
-        dialog.setIcon(QMessageBox.Question)
-        dialog.setText("This video is taking a while to load. Try lower streaming quality?")
-        dialog.setInformativeText(f"SyncRoom can retry this media locally at {lower_quality}. Other room members are not affected.")
-        try_button = dialog.addButton("Try lower quality", QMessageBox.AcceptRole)
-        dialog.addButton("Keep waiting", QMessageBox.RejectRole)
-        dialog.exec()
-        if dialog.clickedButton() is try_button:
-            self.try_lower_streaming_quality(media_url, lower_quality)
-
-    def media_is_ready(self, media_url: str) -> bool:
-        try:
-            status = self.player.get_status()
-        except Exception as exc:
-            append_runtime_log(f"media_is_ready status failed: {exc}")
-            return False
-        if not status.get("running", False):
-            return False
-        loaded_path = str(status.get("media_url") or "")
-        duration = int(status.get("duration_ms") or 0)
-        return bool(loaded_path) and (loaded_path == media_url or self.is_online_media_url(media_url)) and duration > 0
-
-    def try_lower_streaming_quality(self, media_url: str, lower_quality: str) -> None:
-        self.settings_panel.set_streaming_quality(lower_quality)
-        self.player.set_ytdl_format(self.settings_panel.ytdl_format())
-        self.persist_settings()
-        self.show_status(f"Trying {lower_quality}...")
-        self.set_media_url(media_url, broadcast=False)
-
     def remember_polled_state(
         self,
         position_ms: int,
@@ -2007,11 +1905,106 @@ class MainWindow(QMainWindow):
         )
         return abs(int(position_ms) - expected) > threshold
 
+    def expected_room_position_ms(self, payload: dict, playing: bool) -> int:
+        position_ms = max(0, int(payload.get("position_ms") or 0))
+        if not playing:
+            return position_ms
+        expected = position_ms + int(self.estimated_one_way_ms)
+        received_at = payload.get("_received_monotonic")
+        if isinstance(received_at, (int, float)):
+            expected += max(0, int((time.monotonic() - float(received_at)) * 1000))
+        return max(0, expected)
+
+    def remote_sync_can_correct(self, status: dict) -> bool:
+        if self.media_switch_in_progress or self.pending_room_sync is not None:
+            return False
+        if bool(status.get("idle_active")) or bool(status.get("core_idle")):
+            return False
+        if bool(status.get("paused_for_cache")):
+            return False
+        if int(status.get("cache_buffering_state") or 100) < 20:
+            return False
+        return True
+
+    def reset_sync_speed_correction(self, reason: str = "settled") -> None:
+        if not self.smooth_sync_correction_active:
+            return
+        try:
+            self.player.reset_speed()
+            self.last_sync_correction_reason = reason
+        except Exception as exc:
+            append_runtime_log(f"Could not reset mpv sync speed: {exc}")
+        self.smooth_sync_correction_active = False
+
+    def apply_smooth_sync_correction(self, drift_ms: int) -> bool:
+        abs_drift = abs(drift_ms)
+        if abs_drift <= self.SMOOTH_SYNC_MIN_DRIFT_MS:
+            self.reset_sync_speed_correction()
+            return False
+        if abs_drift > self.HARD_SYNC_DRIFT_MS:
+            return False
+
+        speed = 1.0
+        if drift_ms < 0:
+            speed = 1.02 if abs_drift < 350 else 1.05
+        elif drift_ms > 0:
+            speed = 0.98 if abs_drift < 350 else 0.95
+        try:
+            self.player.set_speed(speed)
+            self.smooth_sync_correction_active = speed != 1.0
+            self.last_sync_correction_reason = f"smooth speed {speed:.2f}"
+            self.update_room_sync_state("correcting", "Correcting")
+            return True
+        except Exception as exc:
+            append_runtime_log(f"Could not apply smooth sync correction: {exc}")
+            return False
+
+    def apply_hard_sync_correction(self, expected_position_ms: int) -> bool:
+        now = time.monotonic()
+        if now - self.last_hard_sync_correction_at < self.HARD_SYNC_COOLDOWN_SECONDS:
+            self.last_sync_correction_reason = "hard correction cooldown"
+            return False
+        self.reset_sync_speed_correction("hard seek")
+        self.player.seek_absolute(expected_position_ms)
+        self.last_hard_sync_correction_at = now
+        self.local_seek_target_ms = expected_position_ms
+        self.local_seek_override_until = now + 1.5
+        self.last_sync_correction_reason = "hard seek"
+        self.update_room_sync_state("correcting", "Correcting")
+        return True
+
+    def clamp_remote_position(
+        self,
+        position_ms: int,
+        duration_ms: int,
+        payload: dict,
+    ) -> int:
+        last_action = str(payload.get("last_action") or "").strip().lower()
+        if last_action == "load":
+            if position_ms != 0:
+                append_runtime_log(
+                    "Clamping load action position to zero "
+                    f"media_url={payload.get('media_url') or '<none>'} "
+                    f"position_ms={position_ms} event_id={payload.get('event_id')} "
+                    f"seek_token={payload.get('seek_token')}"
+                )
+            return 0
+        if duration_ms <= 0 or position_ms <= duration_ms + 1000:
+            return max(0, position_ms)
+        clamped = max(0, duration_ms - 1000)
+        append_runtime_log(
+            "Clamping impossible remote position "
+            f"media_url={payload.get('media_url') or '<none>'} "
+            f"position_ms={position_ms} duration_ms={duration_ms} clamped_position_ms={clamped} "
+            f"last_action={last_action or '<none>'} event_id={payload.get('event_id')} "
+            f"seek_token={payload.get('seek_token')}"
+        )
+        return clamped
+
     def apply_server_state(self, payload: dict, settle_mode: bool = False) -> bool:
         if not self.current_media_url:
             return False
 
-        position_ms = int(payload.get("position_ms") or 0)
         playing = bool(payload.get("playing"))
         seek_token = int(payload.get("seek_token") or 0)
         event_id = int(payload.get("event_id") or 0)
@@ -2020,13 +2013,22 @@ class MainWindow(QMainWindow):
         local = self.player.get_status()
         if not local.get("running", True):
             raise RuntimeError("mpv not running yet")
-        if str(local.get("media_url") or "") != self.current_media_url:
+        if self.media_switch_in_progress:
             raise RuntimeError("media not loaded yet")
-        if int(local.get("duration_ms") or 0) <= 0:
+        if not self.mpv_status_matches_current_media(local):
+            raise RuntimeError("media not loaded yet")
+        duration_ms = int(local.get("duration_ms") or 0)
+        if duration_ms <= 0:
             raise RuntimeError("media metadata not ready yet")
+        if not self.remote_sync_can_correct(local) and not settle_mode:
+            raise RuntimeError("media buffering or not ready yet")
+        position_ms = self.expected_room_position_ms(payload, playing)
+        position_ms = self.clamp_remote_position(position_ms, duration_ms, payload)
 
         self.suppress_sync = True
         drift = int(local["position_ms"]) - position_ms
+        self.last_expected_room_position_ms = position_ms
+        self.last_sync_drift_ms = drift
         is_new_event = event_id > self.last_applied_event_id
         explicit_seek = is_new_event and (seek_token > self.last_applied_seek_token or last_action in {"seek", "load"})
         explicit_pause = is_new_event and last_action == "pause"
@@ -2034,55 +2036,78 @@ class MainWindow(QMainWindow):
         changed = False
 
         if explicit_seek:
+            self.reset_sync_speed_correction("explicit seek")
             self.player.seek_absolute(position_ms)
+            self.local_seek_target_ms = position_ms
+            self.local_seek_override_until = time.monotonic() + 1.5
             self.last_applied_seek_token = max(self.last_applied_seek_token, seek_token)
+            self.last_sync_correction_reason = "remote seek"
             changed = True
             local = self.player.get_status()
             drift = int(local["position_ms"]) - position_ms
+            self.last_sync_drift_ms = drift
 
         if playing:
             if not bool(local["playing"]):
-                if explicit_play or abs(drift) > 450 or settle_mode:
-                    if abs(drift) > 450:
-                        self.player.seek_absolute(position_ms)
-                    self.player.play()
-                    changed = True
-            else:
-                if drift > self.PLAYING_REWIND_THRESHOLD_MS:
+                if abs(drift) > self.HARD_SYNC_DRIFT_MS:
+                    changed = self.apply_hard_sync_correction(position_ms) or changed
+                    local = self.player.get_status()
+                    drift = int(local["position_ms"]) - position_ms
+                    self.last_sync_drift_ms = drift
+                elif abs(drift) > 450:
                     self.player.seek_absolute(position_ms)
-                    self.behind_sync_detected_at = None
+                    self.local_seek_target_ms = position_ms
+                    self.local_seek_override_until = time.monotonic() + 1.5
+                    self.last_sync_correction_reason = "play start seek"
                     changed = True
-                elif drift < -self.PLAYING_FASTFORWARD_THRESHOLD_MS:
-                    now = time.monotonic()
-                    if self.behind_sync_detected_at is None:
-                        self.behind_sync_detected_at = now
-                    elif now - self.behind_sync_detected_at >= self.PLAYING_FASTFORWARD_GRACE_SECONDS:
-                        self.player.seek_absolute(position_ms + 250)
-                        self.behind_sync_detected_at = now + 1.5
-                        changed = True
-                else:
+                self.player.play()
+                changed = True
+            else:
+                if abs(drift) <= self.SMOOTH_SYNC_MIN_DRIFT_MS:
                     self.behind_sync_detected_at = None
+                    self.reset_sync_speed_correction()
+                elif abs(drift) <= self.HARD_SYNC_DRIFT_MS:
+                    changed = self.apply_smooth_sync_correction(drift) or changed
+                else:
+                    changed = self.apply_hard_sync_correction(position_ms) or changed
+                    local = self.player.get_status()
+                    drift = int(local["position_ms"]) - position_ms
+                    self.last_sync_drift_ms = drift
         else:
             self.behind_sync_detected_at = None
+            self.reset_sync_speed_correction("paused")
             if bool(local["playing"]):
-                if explicit_pause or abs(drift) > self.PAUSED_SYNC_THRESHOLD_MS or settle_mode:
-                    if abs(drift) > self.PAUSED_SYNC_THRESHOLD_MS:
-                        self.player.seek_absolute(position_ms)
-                    self.player.pause()
-                    changed = True
-            elif abs(drift) > self.PAUSED_SYNC_THRESHOLD_MS:
+                self.player.pause()
+                changed = True
+                local = self.player.get_status()
+                drift = int(local["position_ms"]) - position_ms
+                self.last_sync_drift_ms = drift
+            if abs(drift) > self.PAUSED_SYNC_THRESHOLD_MS or explicit_pause or settle_mode:
                 self.player.seek_absolute(position_ms)
+                self.local_seek_target_ms = position_ms
+                self.local_seek_override_until = time.monotonic() + 1.5
+                self.last_sync_correction_reason = "pause seek"
                 changed = True
 
         if is_new_event:
             self.last_applied_event_id = event_id
+            self.last_accepted_event_id = max(self.last_accepted_event_id, event_id)
 
         verify = self.player.get_status()
         remaining_drift = abs(int(verify["position_ms"]) - position_ms)
         if playing != bool(verify["playing"]):
             raise RuntimeError("playback state not settled yet")
         if remaining_drift > (2200 if playing else 450):
-            raise RuntimeError("position not settled yet")
+            verify_duration = int(verify.get("duration_ms") or 0)
+            verify_position = int(verify.get("position_ms") or 0)
+            if verify_duration > 0 and position_ms >= max(0, verify_duration - 1500) and verify_position >= max(0, verify_duration - 2500):
+                append_runtime_log(
+                    "Treating near-end clamped sync as settled "
+                    f"target_position_ms={position_ms} local_position_ms={verify_position} "
+                    f"duration_ms={verify_duration} event_id={event_id} seek_token={seek_token}"
+                )
+            else:
+                raise RuntimeError("position not settled yet")
 
         self.last_known_playing = playing
         self.remember_polled_state(int(verify["position_ms"]), bool(verify["playing"]))
@@ -2126,6 +2151,9 @@ class MainWindow(QMainWindow):
         elif state == "recovering":
             value = "Syncing"
             caption = note or "catching up to the room"
+        elif state == "correcting":
+            value = "Correcting"
+            caption = note or "sync correction active"
         elif state == "reconnecting":
             value = "Reconnecting"
             caption = note or "waiting for server"
@@ -2141,7 +2169,10 @@ class MainWindow(QMainWindow):
         if self.pending_room_sync is None or self._pending_sync_retry_scheduled:
             return
         self._pending_sync_retry_scheduled = True
-        retry_delay = delay_ms if delay_ms is not None else self.SYNC_RETRY_INTERVAL_MS
+        if delay_ms is not None:
+            retry_delay = delay_ms
+        else:
+            retry_delay = min(1800, self.SYNC_RETRY_INTERVAL_MS + self.pending_room_sync_attempts * 120)
 
         def run_retry() -> None:
             self._pending_sync_retry_scheduled = False
@@ -2150,8 +2181,23 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(retry_delay, run_retry)
 
     def start_pending_room_sync(self, payload: dict, state: str, note: str) -> None:
+        event_id = int(payload.get("event_id") or 0)
+        if event_id < self.last_accepted_event_id:
+            append_runtime_log(
+                "Ignoring stale pending sync "
+                f"event_id={event_id} accepted_event_id={self.last_accepted_event_id}"
+            )
+            return
+        payload_media_url = str(payload.get("media_url") or "")
+        if payload_media_url and self.current_media_url and payload_media_url != self.current_media_url:
+            append_runtime_log(
+                "Ignoring pending sync for stale media "
+                f"payload_media={payload_media_url} current_media={self.current_media_url}"
+            )
+            return
         self.pending_room_sync = dict(payload)
-        self.pending_room_sync_attempts += 1
+        if self.pending_room_sync_attempts <= 0:
+            self.pending_room_sync_attempts = 1
         self.update_room_sync_state(state, note)
         self.schedule_pending_room_sync(250 if self.pending_room_sync_attempts == 1 else None)
 
@@ -2169,16 +2215,65 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self.apply_server_state(self.pending_room_sync, settle_mode=True)
+            settled_payload = dict(self.pending_room_sync)
+            self.apply_server_state(settled_payload, settle_mode=True)
             self.clear_pending_room_sync()
+            if str(settled_payload.get("updated_by") or "") != self.sync_client.client_id:
+                self.maybe_show_remote_playback_osd(settled_payload)
             append_runtime_log("apply_pending_room_sync settled successfully")
         except Exception as exc:
             append_runtime_log(f"apply_pending_room_sync retry due to: {exc}")
+            self.pending_room_sync_attempts += 1
+            if self.pending_room_sync_attempts > self.MAX_PENDING_SYNC_ATTEMPTS:
+                append_runtime_log(
+                    "Pending sync attempt limit reached; giving up "
+                    f"attempts={self.pending_room_sync_attempts} media_url={self.current_media_url or '<none>'}"
+                )
+                self.clear_pending_room_sync()
+                self.update_room_sync_state("connected", "Could not sync automatically. Press Resync.")
+                self.show_status("Could not sync automatically. Press Resync.")
+                return
             note = "Waiting for stream..." if self.pending_room_sync_attempts <= 4 else "Catching up to the room..."
             self.update_room_sync_state("recovering", note)
             self.schedule_pending_room_sync()
         finally:
             self.suppress_sync = False
+
+    def send_verified_playback_state(self, status: dict, target_playing: bool) -> None:
+        position_ms = int(status["position_ms"])
+        self.local_playback_target = target_playing
+        self.local_playback_override_until = time.monotonic() + 1.2
+        self.sync_client.send_state(
+            self.current_media_url,
+            position_ms,
+            target_playing,
+            reason="play" if target_playing else "pause",
+        )
+        self.show_local_playback_osd("play" if target_playing else "pause", position_ms)
+        self.last_known_playing = target_playing
+        self.remember_polled_state(position_ms, target_playing)
+
+    def verify_local_playback_change(self, target_playing: bool, attempts_left: int = 2) -> None:
+        if not self.current_media_url:
+            return
+        try:
+            status = self.player.get_status()
+        except Exception as exc:
+            append_runtime_log(f"local playback verify failed: {exc}")
+            return
+        if self.media_switch_in_progress or not self.mpv_status_matches_current_media(status):
+            return
+        if bool(status["playing"]) == target_playing:
+            self.send_verified_playback_state(status, target_playing)
+            return
+        if attempts_left <= 0:
+            append_runtime_log(
+                "mpv playback command did not settle "
+                f"target_playing={target_playing} observed_playing={bool(status['playing'])}"
+            )
+            self.show_status("mpv did not change playback state yet.")
+            return
+        QTimer.singleShot(150, lambda: self.verify_local_playback_change(target_playing, attempts_left - 1))
 
     def toggle_playback(self) -> None:
         if self.pending_room_sync is not None:
@@ -2186,6 +2281,9 @@ class MainWindow(QMainWindow):
             return
         try:
             status = self.player.get_status()
+            if self.media_switch_in_progress or not self.mpv_status_matches_current_media(status):
+                self.show_status("Wait for the new media to finish loading first")
+                return
             target_playing = not bool(status["playing"])
             if status["playing"]:
                 self.player.pause()
@@ -2193,18 +2291,11 @@ class MainWindow(QMainWindow):
                 self.player.play()
             self.local_playback_target = target_playing
             self.local_playback_override_until = time.monotonic() + 1.2
-            if self.current_media_url:
-                self.sync_client.send_state(
-                    self.current_media_url,
-                    int(status["position_ms"]),
-                    target_playing,
-                    reason="play" if target_playing else "pause",
-                )
-                self.show_local_playback_osd(
-                    "play" if target_playing else "pause",
-                    int(status["position_ms"]),
-                )
-            self.last_known_playing = target_playing
+            verified_status = self.player.get_status()
+            if bool(verified_status["playing"]) == target_playing:
+                self.send_verified_playback_state(verified_status, target_playing)
+            else:
+                QTimer.singleShot(150, lambda: self.verify_local_playback_change(target_playing))
         except Exception as exc:
             self.show_error(f"Could not control mpv: {exc}")
 
@@ -2219,6 +2310,9 @@ class MainWindow(QMainWindow):
         if self.current_media_url:
             try:
                 status = self.player.get_status()
+                if self.media_switch_in_progress or not self.mpv_status_matches_current_media(status):
+                    self.show_status("Wait for the new media to finish loading first")
+                    return
                 target_position = int(self.position_slider.value())
                 self.player.seek_absolute(target_position)
                 self.local_seek_target_ms = target_position
@@ -2256,12 +2350,27 @@ class MainWindow(QMainWindow):
                 self.show_status("mpv was closed, so SyncRoom is closing too")
                 QTimer.singleShot(100, QApplication.instance().quit)
             return
-        self.player_seen_running_in_room = True
-
         position = int(status["position_ms"])
         duration = int(status["duration_ms"])
         playing = bool(status["playing"])
         observed_at = time.monotonic()
+        confirmed_this_poll = False
+
+        if self.media_switch_in_progress:
+            if not self.maybe_confirm_media_loaded(status):
+                self.update_room_sync_state("loading", "Waiting for stream...")
+                return
+            confirmed_this_poll = True
+        elif not self.mpv_status_matches_current_media(status):
+            append_runtime_log(
+                "Ignoring stale mpv status during poll "
+                f"current_media={self.current_media_url or '<none>'} "
+                f"mpv_media={status.get('media_url') or '<none>'} "
+                f"position_ms={position} duration_ms={duration}"
+            )
+            return
+
+        self.player_seen_running_in_room = True
 
         if not self.dragging_slider:
             self.position_slider.setValue(position)
@@ -2272,6 +2381,15 @@ class MainWindow(QMainWindow):
             self.style().standardIcon(QStyle.SP_MediaPause if playing else QStyle.SP_MediaPlay)
         )
         self.play_button.setText("Pause" if playing else "Play")
+
+        if confirmed_this_poll:
+            if self.pending_room_sync is None:
+                self.update_room_sync_state("live", "room sync active")
+            else:
+                self.update_room_sync_state("recovering", "Catching up to the room...")
+                if duration > 0:
+                    self.schedule_pending_room_sync(120)
+            return
 
         if self.pending_room_sync is not None:
             self.update_room_sync_state(
@@ -2331,6 +2449,8 @@ class MainWindow(QMainWindow):
         self.remember_polled_state(position, playing, observed_at)
 
     def on_room_state(self, payload: dict) -> None:
+        payload = dict(payload)
+        payload["_received_monotonic"] = time.monotonic()
         members = payload.get("members") or []
         names = ", ".join(member.get("name", "guest") for member in members) or "none"
         self.set_label_text_safe(
@@ -2353,19 +2473,35 @@ class MainWindow(QMainWindow):
 
         media_url = str(payload.get("media_url") or "")
         position_ms = int(payload.get("position_ms") or 0)
+        playing = bool(payload.get("playing"))
         updated_by = str(payload.get("updated_by") or "")
         event_id = int(payload.get("event_id") or 0)
         first_room_payload = self.last_room_payload is None
-        self.last_room_payload = dict(payload)
-        self.update_diagnostics()
+        previous_accepted_event_id = self.last_accepted_event_id
 
         if first_room_payload and event_id > 0:
             self.last_osd_event_id = max(self.last_osd_event_id, event_id)
+
+        if event_id < self.last_accepted_event_id:
+            append_runtime_log(
+                "Ignoring stale room state "
+                f"event_id={event_id} accepted_event_id={self.last_accepted_event_id} "
+                f"media_url={media_url or '<none>'}"
+            )
+            self.update_diagnostics()
+            return
+
+        if event_id > 0:
+            self.last_accepted_event_id = max(self.last_accepted_event_id, event_id)
+        self.last_room_payload = dict(payload)
+        self.update_diagnostics()
 
         if not media_url:
             return
 
         if updated_by == self.sync_client.client_id:
+            if event_id > 0:
+                self.last_accepted_event_id = max(self.last_accepted_event_id, event_id)
             self.last_osd_event_id = max(self.last_osd_event_id, event_id)
             return
 
@@ -2377,6 +2513,19 @@ class MainWindow(QMainWindow):
             self.url_input.setText(media_url)
             self.set_media_url(media_url, broadcast=False)
             self.start_pending_room_sync(payload, "loading", "Waiting for stream...")
+            return
+
+        if (
+            time.monotonic() < self.local_playback_override_until
+            and self.local_playback_target is not None
+            and playing != self.local_playback_target
+            and event_id <= previous_accepted_event_id
+        ):
+            append_runtime_log(
+                "Ignoring room state that conflicts with local playback override "
+                f"event_id={event_id} accepted_event_id={self.last_accepted_event_id} "
+                f"payload_playing={playing} target_playing={self.local_playback_target}"
+            )
             return
 
         if self.pending_room_sync is not None:
@@ -2400,7 +2549,6 @@ class MainWindow(QMainWindow):
             if self.is_recoverable_sync_error(exc):
                 self.show_status("Waiting for playback to finish loading...")
                 self.start_pending_room_sync(payload, "recovering", "Catching up to the room...")
-                self.maybe_show_remote_playback_osd(payload)
             else:
                 self.show_transient_error(f"Could not sync mpv state: {exc}")
         finally:
@@ -2504,7 +2652,13 @@ class MainWindow(QMainWindow):
     def on_diagnostics_pong(self) -> None:
         if self.pending_ping_sent_at is None:
             return
-        self.last_ping_ms = max(0, int((time.monotonic() - self.pending_ping_sent_at) * 1000))
+        sample_ms = max(0, int((time.monotonic() - self.pending_ping_sent_at) * 1000))
+        self.last_ping_ms = sample_ms
+        if self.estimated_rtt_ms is None:
+            self.estimated_rtt_ms = float(sample_ms)
+        else:
+            self.estimated_rtt_ms = self.estimated_rtt_ms * 0.82 + float(sample_ms) * 0.18
+        self.estimated_one_way_ms = max(0.0, min(250.0, self.estimated_rtt_ms / 2.0))
         self.pending_ping_sent_at = None
         self.update_diagnostics()
 
@@ -2546,20 +2700,18 @@ class MainWindow(QMainWindow):
         self.resync_button.setEnabled(connected and self.last_room_payload is not None)
 
     def current_drift_text(self) -> str:
-        if not self.last_room_payload or self.last_polled_position_ms is None:
+        if self.last_sync_drift_ms is None:
             return "Unknown"
-        media_url = str(self.last_room_payload.get("media_url") or "")
-        if not media_url or media_url != self.current_media_url:
-            return "Unknown"
-        drift_ms = int(self.last_polled_position_ms) - int(self.last_room_payload.get("position_ms") or 0)
-        sign = "+" if drift_ms >= 0 else "-"
-        return f"{sign}{abs(drift_ms)} ms"
+        sign = "+" if self.last_sync_drift_ms >= 0 else "-"
+        return f"{sign}{abs(self.last_sync_drift_ms)} ms"
 
     def diagnostics_sync_text(self) -> str:
         if self.room_sync_state == "live":
             return "Live"
         if self.room_sync_state == "recovering":
             return "Syncing"
+        if self.room_sync_state == "correcting":
+            return "Correcting"
         if self.room_sync_state == "reconnecting":
             return "Reconnecting"
         if self.room_sync_state == "connected":
@@ -2581,6 +2733,8 @@ class MainWindow(QMainWindow):
         yt_dlp_path = self.player.yt_dlp_path()
         mpv_text = mpv_version(mpv_path) if self.player.mpv_available() else ""
         yt_dlp_text = yt_dlp_version(yt_dlp_path) if yt_dlp_path else ""
+        mpv_error_summary = self.player.recent_mpv_error_summary() or "<none>"
+        current_speed = player_status.get("speed", "<unknown>") if isinstance(player_status, dict) else "<unknown>"
         last_yt_dlp_check = (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.yt_dlp_last_check))
             if self.yt_dlp_last_check
@@ -2606,11 +2760,22 @@ class MainWindow(QMainWindow):
             f"Last connection error: {self.last_connection_error or '<none>'}",
             f"Room sync: {self.room_sync_state} / {self.room_sync_note or '<none>'}",
             f"Approx drift: {self.current_drift_text()}",
+            f"Local position: {player_status.get('position_ms', '<unknown>')}",
+            f"Expected room position: {self.last_expected_room_position_ms if self.last_expected_room_position_ms is not None else '<unknown>'}",
+            f"Calculated drift: {self.current_drift_text()}",
+            f"Estimated RTT: {round(self.estimated_rtt_ms, 1) if self.estimated_rtt_ms is not None else '<unknown>'}",
+            f"Estimated one-way delay: {round(self.estimated_one_way_ms, 1)}",
+            f"Current mpv speed: {current_speed}",
+            f"Last hard correction age seconds: {round(time.monotonic() - self.last_hard_sync_correction_at, 2) if self.last_hard_sync_correction_at else '<never>'}",
+            f"Smooth correction active: {self.smooth_sync_correction_active}",
+            f"Last sync correction reason: {self.last_sync_correction_reason}",
             f"Current media URL: {self.current_media_url or '<none>'}",
             f"mpv available: {self.player.mpv_available()}",
             f"mpv running: {self.player.is_running()}",
             f"mpv path: {mpv_path}",
             f"mpv version: {mpv_text or '<unknown>'}",
+            f"mpv log path: {self.player.mpv_log_path}",
+            f"Recent mpv error summary: {mpv_error_summary}",
             f"yt-dlp available: {self.player.yt_dlp_available()}",
             f"yt-dlp path: {yt_dlp_path or '<none>'}",
             f"yt-dlp version: {yt_dlp_text or '<unknown>'}",
@@ -2756,144 +2921,6 @@ class MainWindow(QMainWindow):
         self.persist_settings()
         self.show_status("Playback notifications enabled" if enabled else "Playback notifications disabled")
 
-    def on_yt_dlp_auto_update_changed(self, enabled: bool) -> None:
-        self.persist_settings()
-        self.show_status("yt-dlp auto-update enabled" if enabled else "yt-dlp auto-update disabled")
-        if enabled:
-            self.maybe_start_yt_dlp_auto_update()
-
-    def refresh_media_tools_status(self, note: str = "Media tool status refreshed.") -> None:
-        mpv_path = self.player.mpv_path
-        yt_dlp_path = self.player.yt_dlp_path()
-        mpv_available = self.player.mpv_available()
-        yt_dlp_available = self.player.yt_dlp_available()
-        mpv_text = mpv_version(mpv_path) if mpv_available else ""
-        yt_dlp_text = yt_dlp_version(yt_dlp_path) if yt_dlp_path else ""
-        payload = {
-            "mpv_status": "Installed" if mpv_available else "Missing",
-            "mpv_version": mpv_text or "Unknown",
-            "mpv_path": mpv_path or "Unknown",
-            "yt_dlp_status": "Installed" if yt_dlp_available else "Missing",
-            "yt_dlp_version": yt_dlp_text or "Unknown",
-            "yt_dlp_path": yt_dlp_path or "Unknown",
-            "note": note,
-        }
-        self.settings_panel.set_media_tools_status(payload)
-
-    def update_yt_dlp_now(self) -> None:
-        self.run_media_tools_action("update_yt_dlp", "Updating yt-dlp...", show_dialog=True)
-
-    def repair_mpv_runtime(self) -> None:
-        if os.name != "nt":
-            self.show_status("mpv is managed by your system package manager on Linux.")
-            self.refresh_media_tools_status("mpv is managed by your system package manager on Linux.")
-            return
-        self.run_media_tools_action("repair_mpv", "Repairing mpv...", show_dialog=True)
-
-    def open_media_tools_folder(self) -> None:
-        if os.name == "nt":
-            folder = windows_runtime_root()
-            folder.mkdir(parents=True, exist_ok=True)
-        else:
-            path = self.player.yt_dlp_path() or shutil.which("mpv") or str(Path.home())
-            folder = Path(path).parent if path else Path.home()
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
-        self.show_status("Opened media tools folder.")
-
-    def copy_media_tools_report(self) -> None:
-        QApplication.clipboard().setText(self.settings_panel.media_tools_report())
-        self.show_status("Media tools report copied.")
-
-    def maybe_start_yt_dlp_auto_update(self) -> None:
-        if not self.settings_panel.yt_dlp_auto_update_enabled():
-            return
-        if os.name != "nt":
-            self.refresh_media_tools_status("System yt-dlp is managed outside SyncRoom on Linux.")
-            return
-        now = time.time()
-        if now - self.yt_dlp_last_check < 24 * 60 * 60:
-            self.refresh_media_tools_status("yt-dlp auto-update was checked within the last 24 hours.")
-            return
-        self.yt_dlp_last_check = now
-        self.yt_dlp_last_status = "Checking yt-dlp..."
-        self.persist_settings()
-        self.run_media_tools_action("auto_yt_dlp", "Checking yt-dlp...", show_dialog=False)
-
-    def run_media_tools_action(self, action: str, title: str, *, show_dialog: bool) -> None:
-        if self.media_tools_action_running:
-            self.show_status("Media Tools is already working. Please wait.")
-            return
-        self.media_tools_action_running = True
-        self.settings_panel.set_media_tools_actions_enabled(False)
-        worker = MediaToolsWorker(action)
-        thread = QThread()
-        worker.moveToThread(thread)
-        dialog: ProgressScreenDialog | None = None
-        state = {
-            "success": False,
-            "finished": False,
-            "message": "Media tools updated.",
-        }
-        if show_dialog:
-            dialog = ProgressScreenDialog("MEDIA TOOLS", title, "SyncRoom is preparing local media helpers.")
-            dialog.set_progress("Starting...", 0)
-            worker.progress.connect(dialog.set_progress)
-        else:
-            worker.progress.connect(lambda message, _percent: self.show_status(message))
-
-        def finish(result: object) -> None:
-            data = result if isinstance(result, dict) else {}
-            message = str(data.get("message") or "Media tools updated.")
-            state["success"] = True
-            state["finished"] = True
-            state["message"] = message
-            self.yt_dlp_last_status = message
-            if dialog is not None:
-                dialog.set_progress(f"{message} Closing...", 100)
-            thread.quit()
-
-        def fail(message: str) -> None:
-            state["success"] = False
-            state["finished"] = True
-            state["message"] = message
-            self.yt_dlp_last_status = message
-            append_runtime_log(f"Media tools action failed action={action}: {message}")
-            if dialog is not None:
-                dialog.show_failure(f"Media tools action failed:\n{message}")
-            if not show_dialog:
-                self.show_status("yt-dlp auto-update check failed; see logs.")
-            thread.quit()
-
-        def complete_action() -> None:
-            if not self.media_tools_action_running:
-                return
-            self.media_tools_action_running = False
-            self.settings_panel.set_media_tools_actions_enabled(True)
-            if action in {"update_yt_dlp", "auto_yt_dlp"}:
-                self.player.set_ytdl_format(self.settings_panel.ytdl_format())
-            note = str(state["message"])
-            if not bool(state["success"]):
-                note = f"Media tools action failed: {note}"
-            self.refresh_media_tools_status(note)
-            self.show_status(str(state["message"]) if bool(state["success"]) else "Media tools action failed.")
-
-        def on_thread_finished() -> None:
-            if dialog is not None and bool(state["success"]):
-                QTimer.singleShot(1000, dialog.accept)
-            elif dialog is None:
-                complete_action()
-            self._release_background_job(thread, worker)
-
-        worker.finished.connect(finish)
-        worker.failed.connect(fail)
-        thread.started.connect(worker.run)
-        thread.finished.connect(on_thread_finished)
-        self._track_background_job(thread, worker)
-        thread.start()
-        if dialog is not None:
-            dialog.exec()
-            complete_action()
-
     def apply_subtitle_preferences_with_retry(self) -> None:
         self.refresh_subtitle_tracks(silent=True)
         applied = self.apply_subtitle_preferences()
@@ -3008,117 +3035,6 @@ class MainWindow(QMainWindow):
         if title:
             return f"{lang} - {title}"
         return lang
-
-    @staticmethod
-    def format_osd_time(position_ms: int) -> str:
-        total_seconds = max(0, int(position_ms) // 1000)
-        minutes, seconds = divmod(total_seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        if hours:
-            return f"{hours}:{minutes:02d}:{seconds:02d}"
-        return f"{minutes:02d}:{seconds:02d}"
-
-    @staticmethod
-    def format_osd_actor_name(name: str, fallback: str) -> str:
-        clean_name = " ".join(str(name or "").strip().split()) or fallback
-        if len(clean_name) > 24:
-            clean_name = clean_name[:21].rstrip() + "..."
-        return clean_name
-
-    def remote_actor_name(self, payload: dict) -> str:
-        name = str(payload.get("updated_by_name") or "").strip()
-        updated_by = str(payload.get("updated_by") or "")
-        if not name and updated_by:
-            for member in payload.get("members") or []:
-                if str(member.get("id") or "") == updated_by:
-                    name = str(member.get("name") or "").strip()
-                    break
-        return self.format_osd_actor_name(name, "Someone")
-
-    def local_actor_name(self) -> str:
-        name = self.name_input.text().strip() if hasattr(self, "name_input") else ""
-        if not name:
-            name = str(getattr(self.sync_client, "name", "") or "").strip()
-        return self.format_osd_actor_name(name, "guest")
-
-    def build_action_osd_message(self, action: str, actor_name: str, position_ms: int = 0) -> str | None:
-        action = str(action or "").strip().lower()
-        if action == "pause":
-            return f"{actor_name} paused at {self.format_osd_time(position_ms)}"
-        if action == "play":
-            return f"{actor_name} resumed"
-        if action == "seek":
-            return f"{actor_name} skipped to {self.format_osd_time(position_ms)}"
-        if action == "load":
-            return f"{actor_name} loaded new media"
-        return None
-
-    def build_remote_action_osd_message(self, payload: dict, actor_name: str) -> str | None:
-        return self.build_action_osd_message(
-            str(payload.get("last_action") or ""),
-            actor_name,
-            int(payload.get("position_ms") or 0),
-        )
-
-    def show_local_playback_osd(self, action: str, position_ms: int = 0) -> None:
-        if not self.show_playback_osd:
-            return
-        action = str(action or "").strip().lower()
-        if action not in {"play", "pause", "seek", "load"}:
-            return
-        message = self.build_action_osd_message(action, self.local_actor_name(), position_ms)
-        if not message:
-            return
-        signature = "|".join(
-            [
-                action,
-                str(max(0, int(position_ms)) // 1000),
-                self.current_media_url if action == "load" else "",
-            ]
-        )
-        now = time.monotonic()
-        if signature == self.last_local_osd_signature and now - self.last_local_osd_at < 1.5:
-            return
-        self.last_local_osd_signature = signature
-        self.last_local_osd_at = now
-        self.player.show_osd_message(message)
-
-    def maybe_show_remote_playback_osd(self, payload: dict, *, media_switch: bool = False) -> None:
-        event_id = int(payload.get("event_id") or 0)
-        action = str(payload.get("last_action") or "").strip().lower()
-        updated_by = str(payload.get("updated_by") or "")
-        if event_id <= 0:
-            return
-        if event_id <= self.last_osd_event_id:
-            return
-        if not self.show_playback_osd or updated_by == self.sync_client.client_id:
-            self.last_osd_event_id = max(self.last_osd_event_id, event_id)
-            return
-        if action not in {"play", "pause", "seek", "load"}:
-            self.last_osd_event_id = max(self.last_osd_event_id, event_id)
-            return
-        if media_switch and action != "load":
-            self.last_osd_event_id = max(self.last_osd_event_id, event_id)
-            return
-
-        signature = "|".join(
-            [
-                updated_by,
-                action,
-                str(int(payload.get("position_ms") or 0)),
-                str(int(payload.get("seek_token") or 0)),
-                str(payload.get("media_url") or ""),
-            ]
-        )
-        if signature and signature == self.last_osd_signature:
-            self.last_osd_event_id = max(self.last_osd_event_id, event_id)
-            return
-
-        message = self.build_remote_action_osd_message(payload, self.remote_actor_name(payload))
-        self.last_osd_event_id = max(self.last_osd_event_id, event_id)
-        self.last_osd_signature = signature
-        if message:
-            self.player.show_osd_message(message)
 
     @staticmethod
     def format_ms(value: int) -> str:

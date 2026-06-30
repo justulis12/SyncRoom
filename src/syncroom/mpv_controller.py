@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from syncroom.utils.logging import append_runtime_log, safe_logs_dir
 from syncroom.windows_runtime import (
     ensure_windows_media_runtime,
     windows_mpv_available,
@@ -34,6 +35,9 @@ class MpvController:
     def __init__(self) -> None:
         self.process: subprocess.Popen[bytes] | None = None
         self.ipc_path = self._build_ipc_path()
+        self.mpv_log_path = self._prepare_mpv_log_path()
+        self._mpv_error_start_line = 0
+        self._mpv_load_marker = ""
         self._request_id = 0
         self.mpv_path = self._resolve_mpv_path()
         self._attempted_runtime_install = False
@@ -105,6 +109,8 @@ class MpvController:
             "--force-window=yes",
             "--keep-open=yes",
             f"--input-ipc-server={self.ipc_path}",
+            f"--log-file={self.mpv_log_path}",
+            "--msg-level=all=warn,ytdl_hook=info",
             "--title=SyncRoom Player",
             "--profile=sw-fast",
             "--osd-align-x=left",
@@ -148,6 +154,19 @@ class MpvController:
         self.command(["loadfile", media_url, "replace"])
         self.command(["set_property", "pause", True])
 
+    def mark_media_load_start(self, media_url: str) -> None:
+        safe_url = " ".join(str(media_url or "").strip().split())[:220]
+        marker = f"syncroom-load-start:{uuid.uuid4().hex}"
+        try:
+            existing_lines = self.mpv_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            self._mpv_error_start_line = len(existing_lines)
+            with self.mpv_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"\n[{marker}] {safe_url}\n")
+            self._mpv_load_marker = marker
+        except OSError as exc:
+            self._mpv_load_marker = ""
+            append_runtime_log(f"Could not write mpv load marker: {exc}")
+
     def set_ytdl_format(self, value: str) -> None:
         self.ytdl_format = str(value or "").strip() or "bv*[height<=1080]+ba/b[height<=1080]/b"
         if self.is_running():
@@ -162,6 +181,16 @@ class MpvController:
 
     def pause(self) -> None:
         self.command(["set_property", "pause", True])
+
+    def set_speed(self, speed: float) -> None:
+        clamped = max(0.95, min(1.05, float(speed)))
+        self.command(["set_property", "speed", clamped])
+
+    def get_speed(self) -> float:
+        return float(self.get_property("speed", 1.0) or 1.0)
+
+    def reset_speed(self) -> None:
+        self.set_speed(1.0)
 
     def seek_absolute(self, position_ms: int) -> None:
         self.command(["set_property", "time-pos", max(0.0, position_ms / 1000.0)])
@@ -328,18 +357,104 @@ class MpvController:
                 "position_ms": 0,
                 "duration_ms": 0,
                 "media_url": "",
+                "idle_active": True,
+                "core_idle": True,
+                "track_count": 0,
+                "audio_track_count": 0,
+                "video_track_count": 0,
+                "time_pos_available": False,
+                "eof_reached": False,
+                "paused_for_cache": False,
+                "cache_buffering_state": 0,
+                "speed": 1.0,
             }
         pause = self.get_property("pause", True)
-        time_pos = self.get_property("time-pos", 0)
+        time_pos = self.get_property("time-pos", None)
         duration = self.get_property("duration", 0)
         path = self.get_property("path", "")
+        idle_active = bool(self.get_property("idle-active", False))
+        core_idle = bool(self.get_property("core-idle", False))
+        eof_reached = bool(self.get_property("eof-reached", False))
+        paused_for_cache = bool(self.get_property("paused-for-cache", False))
+        cache_buffering_state = int(self.get_property("cache-buffering-state", 100) or 0)
+        speed = float(self.get_property("speed", 1.0) or 1.0)
+        track_list = self.get_property("track-list", []) or []
+        audio_track_count = sum(1 for track in track_list if track.get("type") == "audio")
+        video_track_count = sum(1 for track in track_list if track.get("type") == "video")
         return {
             "running": True,
             "playing": not bool(pause),
             "position_ms": int(float(time_pos or 0) * 1000),
             "duration_ms": int(float(duration or 0) * 1000),
             "media_url": str(path or ""),
+            "idle_active": idle_active,
+            "core_idle": core_idle,
+            "track_count": len(track_list),
+            "audio_track_count": audio_track_count,
+            "video_track_count": video_track_count,
+            "time_pos_available": time_pos is not None,
+            "eof_reached": eof_reached,
+            "paused_for_cache": paused_for_cache,
+            "cache_buffering_state": cache_buffering_state,
+            "speed": speed,
         }
+
+    def recent_mpv_log_lines(self, max_lines: int = 80) -> list[str]:
+        try:
+            lines = self.mpv_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return []
+        return lines[-max(1, int(max_lines)) :]
+
+    def recent_current_load_mpv_log_lines(self, max_lines: int = 120) -> list[str]:
+        try:
+            lines = self.mpv_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return []
+        scoped_lines = lines[max(0, self._mpv_error_start_line) :]
+        if self._mpv_load_marker:
+            for index, line in enumerate(lines):
+                if self._mpv_load_marker in line:
+                    scoped_lines = lines[index + 1 :]
+                    break
+        return scoped_lines[-max(1, int(max_lines)) :]
+
+    def recent_mpv_error_summary(self) -> str:
+        patterns = (
+            "video unavailable",
+            "this video is unavailable",
+            "sign in to confirm",
+            "age-restricted",
+            "private video",
+            "requested format is not available",
+            "http error",
+            "403",
+            "404",
+            "unable to extract",
+            "no video formats found",
+            "yt-dlp failed",
+            "youtube-dl failed",
+            "error:",
+        )
+        matches: list[str] = []
+        for line in self.recent_current_load_mpv_log_lines(120):
+            lowered = line.lower()
+            if any(pattern in lowered for pattern in patterns):
+                cleaned = " ".join(line.strip().split())
+                if cleaned and cleaned not in matches:
+                    matches.append(cleaned[-240:])
+        return "\n".join(matches[-4:])
+
+    def _prepare_mpv_log_path(self) -> Path:
+        try:
+            log_path = safe_logs_dir() / "mpv.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if log_path.exists() and log_path.stat().st_size > 1024 * 1024:
+                log_path.write_text("", encoding="utf-8")
+            return log_path
+        except Exception as exc:
+            append_runtime_log(f"Could not prepare mpv log path: {exc}")
+            return Path(tempfile.gettempdir()) / "syncroom-mpv.log"
 
     def get_property(self, name: str, default: Any = None) -> Any:
         try:

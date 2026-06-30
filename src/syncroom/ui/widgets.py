@@ -98,7 +98,7 @@ class GradientWordmarkLabel(QWidget):
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
     def set_pixel_size(self, value: int) -> None:
-        self._pixel_size = max(18, int(value))
+        self._pixel_size = max(14, int(value))
         self.updateGeometry()
         self.update()
 
@@ -108,7 +108,9 @@ class GradientWordmarkLabel(QWidget):
         return QSize(self._wordmark_width(metrics) + 24, metrics.height() + 10)
 
     def minimumSizeHint(self) -> QSize:  # type: ignore[override]
-        return self.sizeHint()
+        font = self._wordmark_font()
+        metrics = QFontMetrics(font)
+        return QSize(self._wordmark_width(metrics) + 12, metrics.height() + 6)
 
     def paintEvent(self, _event: QPaintEvent) -> None:  # type: ignore[override]
         rect = QRectF(self.rect()).adjusted(8, 2, -8, -2)

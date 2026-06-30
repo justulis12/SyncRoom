@@ -53,10 +53,11 @@ class SettingsPanel(QWidget):
         super().__init__()
         self.setObjectName("settingsPage")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.media_tools_windows_mode = True
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(16)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(14)
 
         header = QLabel("Settings")
         header.setObjectName("roomTitle")
@@ -85,6 +86,7 @@ class SettingsPanel(QWidget):
         overline_label.setObjectName("sectionOverline")
         title_label = QLabel(title)
         title_label.setObjectName("sectionTitle")
+        title_label.setWordWrap(True)
         description_label = QLabel(description)
         description_label.setObjectName("inlineNote")
         description_label.setWordWrap(True)
@@ -162,7 +164,7 @@ class SettingsPanel(QWidget):
         card, layout = self._build_card(
             "STREAMING",
             "Streaming quality",
-            "Used by yt-dlp for newly loaded online media. Direct video links are unaffected.",
+            "Used for online videos. Local only.",
         )
         self.streaming_quality_combo = NoWheelComboBox()
         self.streaming_quality_combo.setObjectName("elevatedCombo")
@@ -175,11 +177,11 @@ class SettingsPanel(QWidget):
         quality_index = self.streaming_quality_combo.findData(saved_quality)
         self.streaming_quality_combo.setCurrentIndex(max(0, quality_index))
 
-        self.streaming_format_label = QLabel(self.ytdl_format())
-        self.streaming_format_label.setObjectName("inlineNote")
-        self.streaming_format_label.setWordWrap(True)
+        self.streaming_quality_note = QLabel("SyncRoom keeps the technical yt-dlp format in debug reports only.")
+        self.streaming_quality_note.setObjectName("inlineNote")
+        self.streaming_quality_note.setWordWrap(True)
         layout.addWidget(self.streaming_quality_combo, 3, 0, 1, 1)
-        layout.addWidget(self.streaming_format_label, 3, 1, 1, 1)
+        layout.addWidget(self.streaming_quality_note, 3, 1, 1, 1)
         self.streaming_quality_combo.currentIndexChanged.connect(self._on_streaming_quality_changed)
         return card
 
@@ -239,11 +241,13 @@ class SettingsPanel(QWidget):
         action_row = QHBoxLayout()
         action_row.setContentsMargins(0, 4, 0, 0)
         action_row.setSpacing(10)
-        self.open_media_tools_button = QPushButton("Open media tools folder")
+        self.open_media_tools_button = QPushButton("Open folder")
         self.open_media_tools_button.setObjectName("ghostButton")
+        self.open_media_tools_button.setMinimumWidth(0)
         self.open_media_tools_button.clicked.connect(self.openMediaToolsFolderRequested)
-        self.copy_media_tools_button = QPushButton("Copy media tools report")
+        self.copy_media_tools_button = QPushButton("Copy report")
         self.copy_media_tools_button.setObjectName("ghostButton")
+        self.copy_media_tools_button.setMinimumWidth(0)
         self.copy_media_tools_button.clicked.connect(self.copyMediaToolsReportRequested)
         action_row.addWidget(self.open_media_tools_button)
         action_row.addWidget(self.copy_media_tools_button)
@@ -276,6 +280,8 @@ class SettingsPanel(QWidget):
         label = QLabel(text)
         label.setObjectName("toolValue")
         label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         label.setTextInteractionFlags(label.textInteractionFlags() | Qt.TextSelectableByMouse)
         return label
 
@@ -285,7 +291,8 @@ class SettingsPanel(QWidget):
         row.setSpacing(12)
         title_label = QLabel(title)
         title_label.setObjectName("toolLabel")
-        title_label.setMinimumWidth(92)
+        title_label.setMinimumWidth(82)
+        title_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         row.addWidget(title_label, 0)
         row.addWidget(value_label, 1)
         return row
@@ -299,7 +306,6 @@ class SettingsPanel(QWidget):
         self.subtitlePreferenceChanged.emit()
 
     def _on_streaming_quality_changed(self) -> None:
-        self.streaming_format_label.setText(self.ytdl_format())
         self.streamingQualityChanged.emit(self.streaming_quality())
 
     def _update_audio_custom_visibility(self) -> None:
@@ -364,10 +370,23 @@ class SettingsPanel(QWidget):
         self.media_tools_note.setText(payload.get("note", "Media tool status refreshed."))
 
     def set_media_tools_actions_enabled(self, enabled: bool) -> None:
-        self.repair_mpv_button.setEnabled(enabled)
-        self.update_yt_dlp_button.setEnabled(enabled)
+        self.repair_mpv_button.setEnabled(enabled and self.media_tools_windows_mode)
+        self.update_yt_dlp_button.setEnabled(enabled and self.media_tools_windows_mode)
         self.open_media_tools_button.setEnabled(enabled)
         self.copy_media_tools_button.setEnabled(enabled)
+
+    def configure_media_tools_platform(self, is_windows: bool, package_hint: str = "") -> None:
+        self.media_tools_windows_mode = is_windows
+        self.repair_mpv_button.setEnabled(is_windows)
+        self.update_yt_dlp_button.setEnabled(is_windows)
+        if is_windows:
+            self.repair_mpv_button.setText("Repair mpv")
+            self.update_yt_dlp_button.setText("Update yt-dlp now")
+            return
+        self.repair_mpv_button.setText("mpv managed by system")
+        self.update_yt_dlp_button.setText("yt-dlp managed by system")
+        if package_hint:
+            self.media_tools_note.setText(package_hint)
 
     def media_tools_report(self) -> str:
         return "\n".join(

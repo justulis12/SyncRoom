@@ -30,14 +30,18 @@ class RoomState:
     event_id: int = 0
     last_action: str = ""
     updated_at: float = field(default_factory=time.time)
+    last_position_update_monotonic: float = field(default_factory=time.monotonic)
     updated_by: str = ""
     updated_by_name: str = ""
 
     def snapshot(self) -> dict[str, object]:
         position_ms = self.position_ms
+        generated_monotonic = time.monotonic()
         if self.playing:
-            elapsed = int((time.time() - self.updated_at) * 1000)
+            elapsed = int((generated_monotonic - self.last_position_update_monotonic) * 1000)
             position_ms += max(0, elapsed)
+        position_ms = max(0, position_ms)
+        generated_at_ms = int(generated_monotonic * 1000)
         return {
             "type": "room_state",
             "room": self.room,
@@ -49,6 +53,8 @@ class RoomState:
             "last_action": self.last_action,
             "updated_by": self.updated_by,
             "updated_by_name": self.updated_by_name,
+            "server_snapshot_time_ms": generated_at_ms,
+            "server_position_generated_at_ms": generated_at_ms,
             "members": [{"id": c.client_id, "name": c.name} for c in self.clients.values()],
         }
 
@@ -132,6 +138,9 @@ class SyncRoomServer:
             playing = bool(payload.get("playing"))
             force_seek = bool(payload.get("force_seek"))
             reason = str(payload.get("reason") or "").strip().lower()
+            if reason == "load":
+                position_ms = 0
+                playing = False
 
             room.media_url = media_url
             room.position_ms = max(0, position_ms)
@@ -141,6 +150,7 @@ class SyncRoomServer:
             room.event_id += 1
             room.last_action = reason
             room.updated_at = time.time()
+            room.last_position_update_monotonic = time.monotonic()
             room.updated_by = client.client_id
             room.updated_by_name = client.name
             await self.broadcast_room(room.room)
