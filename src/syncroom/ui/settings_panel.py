@@ -363,6 +363,12 @@ class SettingsPanel(QWidget):
         self.yt_dlp_path_value.setText(payload.get("yt_dlp_path", "Unknown"))
         self.media_tools_note.setText(payload.get("note", "Media tool status refreshed."))
 
+    def set_media_tools_actions_enabled(self, enabled: bool) -> None:
+        self.repair_mpv_button.setEnabled(enabled)
+        self.update_yt_dlp_button.setEnabled(enabled)
+        self.open_media_tools_button.setEnabled(enabled)
+        self.copy_media_tools_button.setEnabled(enabled)
+
     def media_tools_report(self) -> str:
         return "\n".join(
             [

@@ -19,7 +19,7 @@ class ProgressScreenDialog(QDialog):
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
         self.setWindowFlag(Qt.WindowCloseButtonHint, False)
         self.setModal(True)
-        self.setFixedSize(520, 240)
+        self.setFixedSize(520, 270)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 28, 28, 28)
@@ -43,12 +43,21 @@ class ProgressScreenDialog(QDialog):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
 
+        self.close_button = QPushButton("Close")
+        self.close_button.setObjectName("secondaryButton")
+        self.close_button.hide()
+        self.close_button.clicked.connect(self.reject)
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(self.close_button)
+
         layout.addWidget(eyebrow)
         layout.addWidget(title)
         layout.addWidget(subtitle)
         layout.addStretch(1)
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress_bar)
+        layout.addLayout(button_row)
 
         self.setStyleSheet(
             """
@@ -84,11 +93,30 @@ class ProgressScreenDialog(QDialog):
                 border-radius: 8px;
                 background: #f0f0f2;
             }
+            QPushButton#secondaryButton {
+                min-width: 86px;
+                min-height: 32px;
+                border-radius: 8px;
+                color: #eeeeef;
+                background: #151516;
+                border: 1px solid #36363a;
+                font-weight: 700;
+            }
+            QPushButton#secondaryButton:hover {
+                border: 1px solid rgba(255, 255, 255, 0.55);
+                background: #202023;
+            }
             """
         )
+
     def set_progress(self, message: str, percent: int) -> None:
         self.status_label.setText(message)
         self.progress_bar.setValue(percent)
+
+    def show_failure(self, message: str) -> None:
+        self.status_label.setText(message)
+        self.progress_bar.setValue(0)
+        self.close_button.show()
 
 
 class StartupSetupDialog(ProgressScreenDialog):

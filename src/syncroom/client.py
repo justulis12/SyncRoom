@@ -343,6 +343,7 @@ class MainWindow(QMainWindow):
         self.yt_dlp_last_status = ""
         self.media_load_watchdog_token = 0
         self.fallback_prompt_seen: set[tuple[str, str]] = set()
+        self.media_tools_action_running = False
         self.custom_host_value = str(self.settings.get("host", "127.0.0.1") or "127.0.0.1")
         if self.custom_host_value == self.HOSTED_SERVER_URL:
             self.custom_host_value = "127.0.0.1"
@@ -2819,10 +2820,20 @@ class MainWindow(QMainWindow):
         self.run_media_tools_action("auto_yt_dlp", "Checking yt-dlp...", show_dialog=False)
 
     def run_media_tools_action(self, action: str, title: str, *, show_dialog: bool) -> None:
+        if self.media_tools_action_running:
+            self.show_status("Media Tools is already working. Please wait.")
+            return
+        self.media_tools_action_running = True
+        self.settings_panel.set_media_tools_actions_enabled(False)
         worker = MediaToolsWorker(action)
         thread = QThread()
         worker.moveToThread(thread)
         dialog: ProgressScreenDialog | None = None
+        state = {
+            "success": False,
+            "finished": False,
+            "message": "Media tools updated.",
+        }
         if show_dialog:
             dialog = ProgressScreenDialog("MEDIA TOOLS", title, "SyncRoom is preparing local media helpers.")
             dialog.set_progress("Starting...", 0)
@@ -2833,36 +2844,55 @@ class MainWindow(QMainWindow):
         def finish(result: object) -> None:
             data = result if isinstance(result, dict) else {}
             message = str(data.get("message") or "Media tools updated.")
+            state["success"] = True
+            state["finished"] = True
+            state["message"] = message
             self.yt_dlp_last_status = message
-            self.show_status(message)
-            self.refresh_media_tools_status(message)
-            if action in {"update_yt_dlp", "auto_yt_dlp"}:
-                self.player.set_ytdl_format(self.settings_panel.ytdl_format())
             if dialog is not None:
-                dialog.set_progress(message, 100)
-                QTimer.singleShot(650, dialog.accept)
+                dialog.set_progress(f"{message} Closing...", 100)
             thread.quit()
 
         def fail(message: str) -> None:
+            state["success"] = False
+            state["finished"] = True
+            state["message"] = message
             self.yt_dlp_last_status = message
             append_runtime_log(f"Media tools action failed action={action}: {message}")
-            self.refresh_media_tools_status(f"Media tools action failed: {message}")
-            if show_dialog:
-                self.show_error(f"Media tools action failed: {message}")
-            else:
-                self.show_status("yt-dlp auto-update check failed; see logs.")
             if dialog is not None:
-                dialog.reject()
+                dialog.show_failure(f"Media tools action failed:\n{message}")
+            if not show_dialog:
+                self.show_status("yt-dlp auto-update check failed; see logs.")
             thread.quit()
+
+        def complete_action() -> None:
+            if not self.media_tools_action_running:
+                return
+            self.media_tools_action_running = False
+            self.settings_panel.set_media_tools_actions_enabled(True)
+            if action in {"update_yt_dlp", "auto_yt_dlp"}:
+                self.player.set_ytdl_format(self.settings_panel.ytdl_format())
+            note = str(state["message"])
+            if not bool(state["success"]):
+                note = f"Media tools action failed: {note}"
+            self.refresh_media_tools_status(note)
+            self.show_status(str(state["message"]) if bool(state["success"]) else "Media tools action failed.")
+
+        def on_thread_finished() -> None:
+            if dialog is not None and bool(state["success"]):
+                QTimer.singleShot(1000, dialog.accept)
+            elif dialog is None:
+                complete_action()
+            self._release_background_job(thread, worker)
 
         worker.finished.connect(finish)
         worker.failed.connect(fail)
         thread.started.connect(worker.run)
-        thread.finished.connect(lambda: self._release_background_job(thread, worker))
+        thread.finished.connect(on_thread_finished)
         self._track_background_job(thread, worker)
         thread.start()
         if dialog is not None:
             dialog.exec()
+            complete_action()
 
     def apply_subtitle_preferences_with_retry(self) -> None:
         self.refresh_subtitle_tracks(silent=True)
