@@ -746,7 +746,8 @@ def run_with_ui(worker_callback: Callable[[ProgressCallback], int], version: str
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("Updating SyncRoom")
-            self.setFixedSize(460, 260)
+            self.setObjectName("updateRoot")
+            self.setFixedSize(500, 320)
             self.close_button = QPushButton("Close")
             self.close_button.setObjectName("secondaryButton")
             self.close_button.hide()
@@ -762,20 +763,20 @@ def run_with_ui(worker_callback: Callable[[ProgressCallback], int], version: str
             layout.setSpacing(12)
 
             eyebrow = QLabel("SYNCROOM UPDATE")
-            eyebrow.setObjectName("eyebrow")
+            eyebrow.setObjectName("updateEyebrow")
             title = QLabel("Updating SyncRoom")
-            title.setObjectName("title")
+            title.setObjectName("updateTitle")
             self.step_label = QLabel("Preparing update")
-            self.step_label.setObjectName("step")
+            self.step_label.setObjectName("updateStep")
             self.detail_label = QLabel("Starting updater...")
-            self.detail_label.setObjectName("detail")
+            self.detail_label.setObjectName("updateDetail")
             self.detail_label.setWordWrap(True)
             self.progress_bar = QProgressBar()
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(0)
             self.progress_bar.setTextVisible(False)
             self.version_label = QLabel(f"Installing {version}")
-            self.version_label.setObjectName("version")
+            self.version_label.setObjectName("updateVersion")
 
             button_row = QHBoxLayout()
             button_row.addStretch(1)
@@ -794,33 +795,36 @@ def run_with_ui(worker_callback: Callable[[ProgressCallback], int], version: str
 
             self.setStyleSheet(
                 """
-                QWidget {
+                QWidget#updateRoot {
                     background: #000000;
                     color: #f7f7f8;
                     font-family: "Noto Sans", "Segoe UI", sans-serif;
+                }
+                QLabel {
+                    background: transparent;
                 }
                 QFrame#updateCard {
                     background: #080808;
                     border: 1px solid #303034;
                     border-radius: 14px;
                 }
-                QLabel#eyebrow {
+                QLabel#updateEyebrow {
                     color: #a3a3aa;
                     font-size: 10px;
                     font-weight: 800;
                     letter-spacing: 0.12em;
                 }
-                QLabel#title {
+                QLabel#updateTitle {
                     color: #ffffff;
                     font-size: 24px;
                     font-weight: 800;
                 }
-                QLabel#step {
+                QLabel#updateStep {
                     color: #f3f3f5;
                     font-size: 15px;
                     font-weight: 700;
                 }
-                QLabel#detail, QLabel#version {
+                QLabel#updateDetail, QLabel#updateVersion {
                     color: #a8a8af;
                     font-size: 12px;
                 }
@@ -877,17 +881,13 @@ def run_with_ui(worker_callback: Callable[[ProgressCallback], int], version: str
     worker.progress.connect(window.set_progress)
     thread.started.connect(worker.run)
     result = {"code": 1}
+    success_close_scheduled = {"value": False}
 
     def finish(exit_code: int) -> None:
         result["code"] = exit_code
         thread.quit()
         if exit_code == 0:
             window.set_progress("Done", "SyncRoom has been updated.", 100)
-            def close_success() -> None:
-                window.close()
-                app.exit(0)
-
-            QTimer.singleShot(1800, close_success)
         else:
             window.show_failure(f"Updater exited with code {exit_code}.")
 
@@ -896,8 +896,24 @@ def run_with_ui(worker_callback: Callable[[ProgressCallback], int], version: str
         thread.quit()
         window.show_failure(message)
 
+    def schedule_success_close() -> None:
+        if result["code"] != 0 or success_close_scheduled["value"]:
+            return
+        success_close_scheduled["value"] = True
+        append_log("success auto-close scheduled")
+
+        def close_success() -> None:
+            append_log("success auto-close fired")
+            window.close()
+            append_log("QApplication exit requested")
+            app.exit(0)
+
+        QTimer.singleShot(1800, close_success)
+
     worker.finished.connect(finish)
     worker.failed.connect(fail)
+    thread.finished.connect(schedule_success_close)
+    thread.finished.connect(worker.deleteLater)
     thread.start()
     app.exec()
     if thread.isRunning():

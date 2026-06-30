@@ -61,9 +61,6 @@ class MpvController:
     def yt_dlp_path(self) -> str:
         candidates: list[Path] = []
         exe_dir = Path(sys.executable).resolve().parent
-        discovered = shutil.which("yt-dlp")
-        if discovered:
-            return discovered
         if os.name == "nt":
             candidates.append(windows_runtime_yt_dlp_path())
         candidates.append(exe_dir / "yt-dlp.exe")
@@ -72,6 +69,10 @@ class MpvController:
         for candidate in candidates:
             if candidate.exists():
                 return str(candidate)
+
+        discovered = shutil.which("yt-dlp")
+        if discovered:
+            return discovered
 
         return ""
 

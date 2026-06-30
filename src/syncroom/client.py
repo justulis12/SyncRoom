@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFontMetrics
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFontMetrics, QIcon
 from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -38,9 +39,9 @@ from syncroom import __version__
 from syncroom.mpv_controller import MpvController
 from syncroom.network.sync_client import SyncClient
 from syncroom.settings import app_config_dir, default_display_name, load_settings, save_settings
-from syncroom.ui.dialogs import StartupSetupDialog, UpdateAvailableDialog
+from syncroom.ui.dialogs import ProgressScreenDialog, StartupSetupDialog, UpdateAvailableDialog
 from syncroom.ui.settings_panel import SettingsPanel
-from syncroom.ui.widgets import NoWheelComboBox
+from syncroom.ui.widgets import GradientWordmarkLabel, NoWheelComboBox
 from syncroom.updates import (
     UpdateInfo,
     check_for_updates,
@@ -54,17 +55,31 @@ from syncroom.utils.logging import (
     safe_logs_dir,
     update_log_path,
 )
+from syncroom.utils.paths import app_icon_path
 from syncroom.windows_runtime import (
     ensure_windows_media_runtime,
+    ensure_windows_mpv_runtime,
+    mpv_version,
+    needs_yt_dlp_update,
+    update_windows_yt_dlp_runtime,
+    windows_runtime_root,
     windows_mpv_available,
     windows_runtime_mpv_path,
     windows_runtime_yt_dlp_path,
     windows_yt_dlp_available,
+    yt_dlp_version,
 )
 
 
 THREAD_SHUTDOWN_TIMEOUT_MS = 5000
 THREAD_FORCE_TERMINATE_TIMEOUT_MS = 2000
+
+
+def syncroom_app_icon() -> QIcon:
+    path = app_icon_path()
+    if not path.exists():
+        return QIcon()
+    return QIcon(str(path))
 
 
 def qapplication_is_closing() -> bool:
@@ -123,6 +138,42 @@ class UpdateCheckWorker(QObject):
 
     def run(self) -> None:
         self.finished.emit(check_for_updates())
+
+
+class MediaToolsWorker(QObject):
+    progress = Signal(str, int)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, action: str) -> None:
+        super().__init__()
+        self.action = action
+
+    def run(self) -> None:
+        try:
+            if self.action == "repair_mpv":
+                if os.name != "nt":
+                    raise RuntimeError("mpv is managed by your Linux package manager.")
+                path = ensure_windows_mpv_runtime(self._report)
+                self.finished.emit({"action": self.action, "path": str(path), "message": "mpv repaired."})
+                return
+            if self.action == "update_yt_dlp":
+                path = update_windows_yt_dlp_runtime(self._report)
+                self.finished.emit({"action": self.action, "path": str(path), "message": "yt-dlp updated."})
+                return
+            if self.action == "auto_yt_dlp":
+                if os.name == "nt" and needs_yt_dlp_update():
+                    path = update_windows_yt_dlp_runtime(self._report)
+                    self.finished.emit({"action": self.action, "path": str(path), "message": "yt-dlp updated."})
+                    return
+                self.finished.emit({"action": self.action, "path": "", "message": "yt-dlp already up to date."})
+                return
+            raise RuntimeError(f"Unknown media tools action: {self.action}")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _report(self, message: str, percent: int) -> None:
+        self.progress.emit(message, percent)
 
 
 def prepare_windows_runtime_if_needed() -> bool:
@@ -226,6 +277,9 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SyncRoom")
+        icon = syncroom_app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
         self.resize(1100, 720)
         self.setMinimumSize(720, 520)
         self.settings = load_settings()
@@ -285,6 +339,10 @@ class MainWindow(QMainWindow):
         self.reconnect_status = "idle"
         self.last_ping_ms: int | None = None
         self.pending_ping_sent_at: float | None = None
+        self.yt_dlp_last_check = float(self.settings.get("yt_dlp_last_check", 0) or 0)
+        self.yt_dlp_last_status = ""
+        self.media_load_watchdog_token = 0
+        self.fallback_prompt_seen: set[tuple[str, str]] = set()
         self.custom_host_value = str(self.settings.get("host", "127.0.0.1") or "127.0.0.1")
         if self.custom_host_value == self.HOSTED_SERVER_URL:
             self.custom_host_value = "127.0.0.1"
@@ -310,6 +368,8 @@ class MainWindow(QMainWindow):
         self.heartbeat.start()
         if os.name == "nt":
             QTimer.singleShot(2000, self.start_update_check)
+        QTimer.singleShot(800, self.refresh_media_tools_status)
+        QTimer.singleShot(2500, self.maybe_start_yt_dlp_auto_update)
 
     def build_ui(self) -> None:
         central = QWidget(self)
@@ -344,6 +404,11 @@ class MainWindow(QMainWindow):
         self.settings_panel.subtitlePreferenceChanged.connect(self.on_subtitle_preference_changed)
         self.settings_panel.streamingQualityChanged.connect(self.on_streaming_quality_changed)
         self.settings_panel.playbackNotificationsChanged.connect(self.on_playback_notifications_changed)
+        self.settings_panel.ytDlpAutoUpdateChanged.connect(self.on_yt_dlp_auto_update_changed)
+        self.settings_panel.updateYtDlpRequested.connect(self.update_yt_dlp_now)
+        self.settings_panel.repairMpvRequested.connect(self.repair_mpv_runtime)
+        self.settings_panel.openMediaToolsFolderRequested.connect(self.open_media_tools_folder)
+        self.settings_panel.copyMediaToolsReportRequested.connect(self.copy_media_tools_report)
         self.page_stack.addWidget(self.make_scroll_page(self.settings_panel))
         self.page_stack.currentChanged.connect(self.update_page_chrome)
 
@@ -434,10 +499,13 @@ class MainWindow(QMainWindow):
         for chip in (self.lobby_nav_chip, self.room_nav_chip, self.settings_nav_chip):
             nav_layout.addWidget(chip)
 
+        self.brand_wordmark = GradientWordmarkLabel("SyncRoom")
+
         self.top_bar_row = QHBoxLayout()
         self.top_bar_row.setContentsMargins(0, 0, 0, 0)
         self.top_bar_row.addWidget(nav_capsule)
         self.top_bar_row.addStretch(1)
+        self.top_bar_row.addWidget(self.brand_wordmark)
         top_layout.addLayout(self.top_bar_row)
         return top_bar
 
@@ -1175,6 +1243,9 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "top_bar_row"):
             self.top_bar_row.setSpacing(10 if room_compact else 12)
+        if hasattr(self, "brand_wordmark"):
+            self.brand_wordmark.setVisible(width >= 820)
+            self.brand_wordmark.set_pixel_size(max(20, round(24 * self.compute_ui_scale())))
         if hasattr(self, "join_shell_layout"):
             self.join_shell_layout.setDirection(QBoxLayout.TopToBottom)
             self.join_shell_layout.setSpacing(12 if room_compact else 14)
@@ -1419,6 +1490,20 @@ class MainWindow(QMainWindow):
                 font-size: __NOTE_PX__px;
                 font-weight: 800;
             }
+            QLabel#switchTitle, QLabel#toolValue {
+                color: #f7f7f8;
+                font-size: __BODY_PX__px;
+                font-weight: 800;
+            }
+            QLabel#toolLabel {
+                color: rgba(168, 168, 174, 0.82);
+                font-size: __NOTE_PX__px;
+                font-weight: 800;
+                text-transform: uppercase;
+            }
+            QWidget#switchRow {
+                background: transparent;
+            }
             QLabel#playerHint {
                 color: #ffffff;
                 font-size: __SECTION_PX__px;
@@ -1568,27 +1653,6 @@ class MainWindow(QMainWindow):
                 color: #f5f5f7;
                 outline: 0;
                 padding: 6px;
-            }
-            QCheckBox#settingsCheck {
-                min-height: __CONTROL_H__px;
-                color: #f2f2f4;
-                font-weight: 800;
-                spacing: 10px;
-            }
-            QCheckBox#settingsCheck::indicator {
-                width: 18px;
-                height: 18px;
-                border-radius: 5px;
-                border: 1px solid rgba(118, 118, 124, 0.44);
-                background: rgba(8, 8, 9, 0.98);
-            }
-            QCheckBox#settingsCheck::indicator:hover {
-                border: 1px solid rgba(255, 255, 255, 0.55);
-                background: rgba(22, 22, 23, 0.98);
-            }
-            QCheckBox#settingsCheck::indicator:checked {
-                border: 1px solid rgba(255, 255, 255, 0.64);
-                background: rgba(236, 236, 238, 0.94);
             }
             QStatusBar {
                 background: rgba(4, 4, 4, 0.99);
@@ -1799,6 +1863,9 @@ class MainWindow(QMainWindow):
         self.show_status(f"Copied room name: {room_name}")
 
     def set_media_url(self, media_url: str, broadcast: bool) -> None:
+        previous_media_url = self.current_media_url
+        if media_url != previous_media_url:
+            self.fallback_prompt_seen.clear()
         self.current_media_url = media_url
         self.set_label_text_safe(
             self.current_media_label,
@@ -1806,11 +1873,13 @@ class MainWindow(QMainWindow):
             elide_mode=Qt.ElideMiddle,
         )
         append_runtime_log(f"Loading media broadcast={broadcast}")
+        loaded = False
         try:
             self.suppress_sync = True
             if os.name == "nt" and self.player.needs_windows_mpv_runtime_install():
                 self.show_status("First-time setup: downloading mpv for Windows...")
             self.player.load(media_url)
+            loaded = True
             self.position_slider.setRange(0, 0)
             self.position_slider.setValue(0)
             self.position_label.setText("00:00")
@@ -1832,6 +1901,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(450, self.apply_audio_preferences_with_retry)
             QTimer.singleShot(300, self.refresh_subtitle_tracks)
             QTimer.singleShot(500, self.apply_subtitle_preferences_with_retry)
+            self.start_media_load_watchdog(media_url)
             self.persist_settings()
         except Exception as exc:
             append_runtime_log(f"set_media_url failed: {exc}")
@@ -1843,8 +1913,72 @@ class MainWindow(QMainWindow):
             )
         finally:
             self.suppress_sync = False
-        if broadcast:
+        if broadcast and loaded:
             self.sync_client.send_state(self.current_media_url, 0, False, reason="load")
+
+    def is_online_media_url(self, media_url: str) -> bool:
+        return media_url.strip().lower().startswith(("http://", "https://"))
+
+    def lower_streaming_quality(self, quality: str) -> str:
+        order = ["360p", "480p", "720p", "1080p", "4k"]
+        try:
+            index = order.index(quality)
+        except ValueError:
+            return ""
+        if index <= 0:
+            return ""
+        return order[index - 1]
+
+    def start_media_load_watchdog(self, media_url: str) -> None:
+        if not self.is_online_media_url(media_url):
+            return
+        quality = self.settings_panel.streaming_quality()
+        if not self.lower_streaming_quality(quality):
+            return
+        self.media_load_watchdog_token += 1
+        token = self.media_load_watchdog_token
+        QTimer.singleShot(15000, lambda: self.check_media_load_watchdog(token, media_url, quality))
+
+    def check_media_load_watchdog(self, token: int, media_url: str, quality: str) -> None:
+        if token != self.media_load_watchdog_token or media_url != self.current_media_url:
+            return
+        if (media_url, quality) in self.fallback_prompt_seen:
+            return
+        if self.media_is_ready(media_url):
+            return
+        lower_quality = self.lower_streaming_quality(quality)
+        if not lower_quality:
+            return
+        self.fallback_prompt_seen.add((media_url, quality))
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("SyncRoom")
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setText("This video is taking a while to load. Try lower streaming quality?")
+        dialog.setInformativeText(f"SyncRoom can retry this media locally at {lower_quality}. Other room members are not affected.")
+        try_button = dialog.addButton("Try lower quality", QMessageBox.AcceptRole)
+        dialog.addButton("Keep waiting", QMessageBox.RejectRole)
+        dialog.exec()
+        if dialog.clickedButton() is try_button:
+            self.try_lower_streaming_quality(media_url, lower_quality)
+
+    def media_is_ready(self, media_url: str) -> bool:
+        try:
+            status = self.player.get_status()
+        except Exception as exc:
+            append_runtime_log(f"media_is_ready status failed: {exc}")
+            return False
+        if not status.get("running", False):
+            return False
+        loaded_path = str(status.get("media_url") or "")
+        duration = int(status.get("duration_ms") or 0)
+        return bool(loaded_path) and (loaded_path == media_url or self.is_online_media_url(media_url)) and duration > 0
+
+    def try_lower_streaming_quality(self, media_url: str, lower_quality: str) -> None:
+        self.settings_panel.set_streaming_quality(lower_quality)
+        self.player.set_ytdl_format(self.settings_panel.ytdl_format())
+        self.persist_settings()
+        self.show_status(f"Trying {lower_quality}...")
+        self.set_media_url(media_url, broadcast=False)
 
     def remember_polled_state(
         self,
@@ -2442,6 +2576,15 @@ class MainWindow(QMainWindow):
         payload = self.last_room_payload or {}
         app_path = Path(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]).resolve()
         updater_path = app_path.with_name("SyncRoomUpdate.exe")
+        mpv_path = self.player.mpv_path
+        yt_dlp_path = self.player.yt_dlp_path()
+        mpv_text = mpv_version(mpv_path) if self.player.mpv_available() else ""
+        yt_dlp_text = yt_dlp_version(yt_dlp_path) if yt_dlp_path else ""
+        last_yt_dlp_check = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.yt_dlp_last_check))
+            if self.yt_dlp_last_check
+            else "<never>"
+        )
         lines = [
             f"SyncRoom version: {__version__}",
             f"OS/platform: {platform.platform()}",
@@ -2465,11 +2608,18 @@ class MainWindow(QMainWindow):
             f"Current media URL: {self.current_media_url or '<none>'}",
             f"mpv available: {self.player.mpv_available()}",
             f"mpv running: {self.player.is_running()}",
-            f"mpv path: {self.player.mpv_path}",
+            f"mpv path: {mpv_path}",
+            f"mpv version: {mpv_text or '<unknown>'}",
             f"yt-dlp available: {self.player.yt_dlp_available()}",
-            f"yt-dlp path: {self.player.yt_dlp_path() or '<none>'}",
+            f"yt-dlp path: {yt_dlp_path or '<none>'}",
+            f"yt-dlp version: {yt_dlp_text or '<unknown>'}",
+            f"yt-dlp auto-update enabled: {self.settings_panel.yt_dlp_auto_update_enabled()}",
+            f"Last yt-dlp check time: {last_yt_dlp_check}",
+            f"Last yt-dlp status: {self.yt_dlp_last_status or '<none>'}",
             f"Selected streaming quality: {self.settings_panel.streaming_quality()}",
             f"Effective ytdl-format: {self.player.effective_ytdl_format()}",
+            f"Fallback prompts seen: {sorted(self.fallback_prompt_seen)}",
+            f"Media watchdog token: {self.media_load_watchdog_token}",
             f"Windows runtime mpv cache path: {windows_runtime_mpv_path() if os.name == 'nt' else '<not Windows>'}",
             f"Windows runtime mpv cache available: {windows_mpv_available() if os.name == 'nt' else '<not Windows>'}",
             f"Windows runtime yt-dlp cache path: {windows_runtime_yt_dlp_path() if os.name == 'nt' else '<not Windows>'}",
@@ -2604,6 +2754,115 @@ class MainWindow(QMainWindow):
         self.show_playback_osd = bool(enabled)
         self.persist_settings()
         self.show_status("Playback notifications enabled" if enabled else "Playback notifications disabled")
+
+    def on_yt_dlp_auto_update_changed(self, enabled: bool) -> None:
+        self.persist_settings()
+        self.show_status("yt-dlp auto-update enabled" if enabled else "yt-dlp auto-update disabled")
+        if enabled:
+            self.maybe_start_yt_dlp_auto_update()
+
+    def refresh_media_tools_status(self, note: str = "Media tool status refreshed.") -> None:
+        mpv_path = self.player.mpv_path
+        yt_dlp_path = self.player.yt_dlp_path()
+        mpv_available = self.player.mpv_available()
+        yt_dlp_available = self.player.yt_dlp_available()
+        mpv_text = mpv_version(mpv_path) if mpv_available else ""
+        yt_dlp_text = yt_dlp_version(yt_dlp_path) if yt_dlp_path else ""
+        payload = {
+            "mpv_status": "Installed" if mpv_available else "Missing",
+            "mpv_version": mpv_text or "Unknown",
+            "mpv_path": mpv_path or "Unknown",
+            "yt_dlp_status": "Installed" if yt_dlp_available else "Missing",
+            "yt_dlp_version": yt_dlp_text or "Unknown",
+            "yt_dlp_path": yt_dlp_path or "Unknown",
+            "note": note,
+        }
+        self.settings_panel.set_media_tools_status(payload)
+
+    def update_yt_dlp_now(self) -> None:
+        self.run_media_tools_action("update_yt_dlp", "Updating yt-dlp...", show_dialog=True)
+
+    def repair_mpv_runtime(self) -> None:
+        if os.name != "nt":
+            self.show_status("mpv is managed by your system package manager on Linux.")
+            self.refresh_media_tools_status("mpv is managed by your system package manager on Linux.")
+            return
+        self.run_media_tools_action("repair_mpv", "Repairing mpv...", show_dialog=True)
+
+    def open_media_tools_folder(self) -> None:
+        if os.name == "nt":
+            folder = windows_runtime_root()
+            folder.mkdir(parents=True, exist_ok=True)
+        else:
+            path = self.player.yt_dlp_path() or shutil.which("mpv") or str(Path.home())
+            folder = Path(path).parent if path else Path.home()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        self.show_status("Opened media tools folder.")
+
+    def copy_media_tools_report(self) -> None:
+        QApplication.clipboard().setText(self.settings_panel.media_tools_report())
+        self.show_status("Media tools report copied.")
+
+    def maybe_start_yt_dlp_auto_update(self) -> None:
+        if not self.settings_panel.yt_dlp_auto_update_enabled():
+            return
+        if os.name != "nt":
+            self.refresh_media_tools_status("System yt-dlp is managed outside SyncRoom on Linux.")
+            return
+        now = time.time()
+        if now - self.yt_dlp_last_check < 24 * 60 * 60:
+            self.refresh_media_tools_status("yt-dlp auto-update was checked within the last 24 hours.")
+            return
+        self.yt_dlp_last_check = now
+        self.yt_dlp_last_status = "Checking yt-dlp..."
+        self.persist_settings()
+        self.run_media_tools_action("auto_yt_dlp", "Checking yt-dlp...", show_dialog=False)
+
+    def run_media_tools_action(self, action: str, title: str, *, show_dialog: bool) -> None:
+        worker = MediaToolsWorker(action)
+        thread = QThread()
+        worker.moveToThread(thread)
+        dialog: ProgressScreenDialog | None = None
+        if show_dialog:
+            dialog = ProgressScreenDialog("MEDIA TOOLS", title, "SyncRoom is preparing local media helpers.")
+            dialog.set_progress("Starting...", 0)
+            worker.progress.connect(dialog.set_progress)
+        else:
+            worker.progress.connect(lambda message, _percent: self.show_status(message))
+
+        def finish(result: object) -> None:
+            data = result if isinstance(result, dict) else {}
+            message = str(data.get("message") or "Media tools updated.")
+            self.yt_dlp_last_status = message
+            self.show_status(message)
+            self.refresh_media_tools_status(message)
+            if action in {"update_yt_dlp", "auto_yt_dlp"}:
+                self.player.set_ytdl_format(self.settings_panel.ytdl_format())
+            if dialog is not None:
+                dialog.set_progress(message, 100)
+                QTimer.singleShot(650, dialog.accept)
+            thread.quit()
+
+        def fail(message: str) -> None:
+            self.yt_dlp_last_status = message
+            append_runtime_log(f"Media tools action failed action={action}: {message}")
+            self.refresh_media_tools_status(f"Media tools action failed: {message}")
+            if show_dialog:
+                self.show_error(f"Media tools action failed: {message}")
+            else:
+                self.show_status("yt-dlp auto-update check failed; see logs.")
+            if dialog is not None:
+                dialog.reject()
+            thread.quit()
+
+        worker.finished.connect(finish)
+        worker.failed.connect(fail)
+        thread.started.connect(worker.run)
+        thread.finished.connect(lambda: self._release_background_job(thread, worker))
+        self._track_background_job(thread, worker)
+        thread.start()
+        if dialog is not None:
+            dialog.exec()
 
     def apply_subtitle_preferences_with_retry(self) -> None:
         self.refresh_subtitle_tracks(silent=True)
@@ -3057,6 +3316,8 @@ class MainWindow(QMainWindow):
                 "subtitle_custom_preferences": self.settings_panel.subtitle_custom_preferences(),
                 "streaming_quality": self.settings_panel.streaming_quality(),
                 "playback_osd": self.settings_panel.playback_notifications_enabled(),
+                "yt_dlp_auto_update": self.settings_panel.yt_dlp_auto_update_enabled(),
+                "yt_dlp_last_check": self.yt_dlp_last_check,
             }
         )
 
@@ -3126,6 +3387,9 @@ def main() -> None:
         except Exception:
             pass
         app = QApplication(sys.argv)
+        icon = syncroom_app_icon()
+        if not icon.isNull():
+            app.setWindowIcon(icon)
         if not prepare_windows_runtime_if_needed():
             sys.exit(1)
         window = MainWindow()

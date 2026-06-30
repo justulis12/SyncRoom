@@ -16,6 +16,7 @@ from syncroom.utils.logging import append_runtime_log
 
 MPV_RELEASE_API = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
 SEVEN_ZIP_RELEASE_API = "https://api.github.com/repos/ip7z/7zip/releases/latest"
+YT_DLP_RELEASE_API = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
 YT_DLP_DOWNLOAD_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 APP_DIR_NAME = "SyncRoom"
 RUNTIME_DIR_NAME = "mpv-runtime"
@@ -163,16 +164,70 @@ def ensure_windows_yt_dlp_runtime(progress: ProgressCallback | None = None) -> P
         return yt_dlp_path
 
     discovered = shutil.which("yt-dlp")
-    if discovered:
+    if discovered and os.name != "nt":
         _notify(progress, "yt-dlp already installed.", 95)
         _log(f"yt-dlp available on PATH at {discovered}")
         return Path(discovered)
 
+    return update_windows_yt_dlp_runtime(progress)
+
+
+def yt_dlp_version(path: Path | str) -> str:
+    return _tool_version(path, ["--version"])
+
+
+def mpv_version(path: Path | str) -> str:
+    raw = _tool_version(path, ["--version"])
+    return raw.splitlines()[0].strip() if raw else ""
+
+
+def latest_yt_dlp_version() -> str:
+    request = urllib.request.Request(
+        YT_DLP_RELEASE_API,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "SyncRoom",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.load(response)
+    latest = str(payload.get("tag_name") or payload.get("name") or "").strip()
+    if latest.startswith("yt-dlp "):
+        latest = latest.removeprefix("yt-dlp ").strip()
+    return latest.lstrip("v")
+
+
+def needs_yt_dlp_update() -> bool:
+    yt_dlp_path = windows_runtime_yt_dlp_path()
+    if os.name == "nt":
+        if not yt_dlp_path.exists():
+            return True
+        installed = yt_dlp_version(yt_dlp_path)
+    else:
+        discovered = shutil.which("yt-dlp")
+        if not discovered:
+            return False
+        installed = yt_dlp_version(discovered)
+    latest = latest_yt_dlp_version()
+    if not latest:
+        return False
+    return _normalize_version(installed) != _normalize_version(latest)
+
+
+def update_windows_yt_dlp_runtime(progress: ProgressCallback | None = None) -> Path:
+    if os.name != "nt":
+        discovered = shutil.which("yt-dlp")
+        if not discovered:
+            raise RuntimeError("yt-dlp is not installed. Install it with your system package manager.")
+        _notify(progress, "System yt-dlp is managed outside SyncRoom.", 100)
+        return Path(discovered)
+
+    yt_dlp_path = windows_runtime_yt_dlp_path()
     runtime_dir = yt_dlp_path.parent
     part_path = yt_dlp_path.with_name(f"{yt_dlp_path.name}.part")
     runtime_dir.mkdir(parents=True, exist_ok=True)
     _safe_unlink(part_path)
-    _log(f"Installing yt-dlp runtime to {yt_dlp_path}")
+    _log(f"Installing or updating yt-dlp runtime to {yt_dlp_path}")
     _notify(progress, "Downloading yt-dlp...", 90)
 
     try:
@@ -188,13 +243,38 @@ def ensure_windows_yt_dlp_runtime(progress: ProgressCallback | None = None) -> P
     except Exception as exc:
         _safe_unlink(part_path)
         _log(f"yt-dlp download failed: {exc}")
-        raise RuntimeError(f"Could not install yt-dlp: {exc}") from exc
+        raise RuntimeError(f"Could not update yt-dlp: {exc}") from exc
 
     if not yt_dlp_path.exists():
         raise RuntimeError("yt-dlp download completed, but yt-dlp.exe was not found.")
-    _notify(progress, "yt-dlp installed.", 99)
-    _log(f"yt-dlp runtime installed at {yt_dlp_path}")
+    _notify(progress, "yt-dlp updated.", 99)
+    _log(f"yt-dlp runtime installed/updated at {yt_dlp_path}")
     return yt_dlp_path
+
+
+def _tool_version(path: Path | str, args: list[str]) -> str:
+    command = [str(path), *args]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except Exception as exc:
+        _log(f"Could not read version from {path}: {exc}")
+        return ""
+    if result.returncode != 0:
+        _log(f"Version command failed for {path}: {(result.stdout or '').strip()}")
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _normalize_version(value: str) -> str:
+    return str(value or "").strip().removeprefix("yt-dlp ").lstrip("v")
 
 
 def _load_latest_release() -> dict:

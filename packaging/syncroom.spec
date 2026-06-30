@@ -3,6 +3,8 @@
 from pathlib import Path
 
 ROOT = Path.cwd().resolve()
+APP_ICON = ROOT / "packaging" / "windows" / "syncroom.ico"
+APP_ICON_PNG = ROOT / "assets" / "syncroom.png"
 hiddenimports = [
     "PySide6.QtCore",
     "PySide6.QtGui",
@@ -14,7 +16,7 @@ a = Analysis(
     [str(ROOT / "src" / "syncroom" / "client.py")],
     pathex=[str(ROOT / "src")],
     binaries=[],
-    datas=[],
+    datas=[(str(APP_ICON_PNG), "assets")],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -32,6 +34,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
+    icon=str(APP_ICON),
 )
 u = Analysis(
     [str(ROOT / "src" / "syncroom" / "updater.py")],

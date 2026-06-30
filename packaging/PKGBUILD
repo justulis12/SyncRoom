@@ -18,7 +18,7 @@ build() {
 package() {
   cd "$srcdir/$pkgname-$pkgver"
   python -m installer --destdir="$pkgdir" dist/*.whl
-  install -Dm644 assets/syncroom.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/syncroom.svg"
+  install -Dm644 assets/syncroom.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/syncroom.png"
   install -Dm644 packaging/linux/syncroom-system.desktop \
     "$pkgdir/usr/share/applications/syncroom.desktop"
 }

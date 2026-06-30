@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox,
     QFrame,
     QGridLayout,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
-from syncroom.ui.widgets import NoWheelComboBox
+from syncroom.ui.widgets import NoWheelComboBox, ToggleSwitch
 
 
 AUDIO_PRESETS: dict[str, str] = {
@@ -42,6 +43,11 @@ class SettingsPanel(QWidget):
     subtitlePreferenceChanged = Signal()
     streamingQualityChanged = Signal(str)
     playbackNotificationsChanged = Signal(bool)
+    ytDlpAutoUpdateChanged = Signal(bool)
+    updateYtDlpRequested = Signal()
+    repairMpvRequested = Signal()
+    openMediaToolsFolderRequested = Signal()
+    copyMediaToolsReportRequested = Signal()
 
     def __init__(self, settings: dict) -> None:
         super().__init__()
@@ -63,6 +69,7 @@ class SettingsPanel(QWidget):
         layout.addWidget(self._build_subtitle_card(settings))
         layout.addWidget(self._build_streaming_card(settings))
         layout.addWidget(self._build_notifications_card(settings))
+        layout.addWidget(self._build_media_tools_card(settings))
         layout.addStretch(1)
 
     def _build_card(self, overline: str, title: str, description: str) -> tuple[QFrame, QGridLayout]:
@@ -182,12 +189,106 @@ class SettingsPanel(QWidget):
             "Playback notifications",
             "Show mpv OSD messages for local and remote play, pause, seek, and media load actions.",
         )
-        self.playback_notifications_check = QCheckBox("Show playback OSD notifications")
-        self.playback_notifications_check.setObjectName("settingsCheck")
-        self.playback_notifications_check.setChecked(self._settings_bool(settings.get("playback_osd", True)))
-        self.playback_notifications_check.toggled.connect(self.playbackNotificationsChanged)
-        layout.addWidget(self.playback_notifications_check, 3, 0, 1, 2)
+        row = self._build_switch_row("Playback notifications", "Show local mpv OSD messages for room actions.")
+        self.playback_notifications_switch = row.findChild(ToggleSwitch)
+        self.playback_notifications_switch.setChecked(self._settings_bool(settings.get("playback_osd", True)))
+        self.playback_notifications_switch.toggled.connect(self.playbackNotificationsChanged)
+        layout.addWidget(row, 3, 0, 1, 2)
         return card
+
+    def _build_media_tools_card(self, settings: dict) -> QFrame:
+        card, layout = self._build_card(
+            "MEDIA TOOLS",
+            "mpv and yt-dlp",
+            "Inspect and repair local media helpers without changing the installer bundle.",
+        )
+        self.mpv_status_value = self._build_tool_value("Checking...")
+        self.mpv_version_value = self._build_tool_value("Unknown")
+        self.mpv_path_value = self._build_tool_value("Unknown")
+        self.yt_dlp_status_value = self._build_tool_value("Checking...")
+        self.yt_dlp_version_value = self._build_tool_value("Unknown")
+        self.yt_dlp_path_value = self._build_tool_value("Unknown")
+        self.media_tools_note = QLabel("Media tool actions run locally and keep SyncRoom responsive.")
+        self.media_tools_note.setObjectName("inlineNote")
+        self.media_tools_note.setWordWrap(True)
+
+        layout.addLayout(self._build_tool_row("mpv status", self.mpv_status_value), 3, 0, 1, 2)
+        layout.addLayout(self._build_tool_row("mpv version", self.mpv_version_value), 4, 0, 1, 2)
+        layout.addLayout(self._build_tool_row("mpv path", self.mpv_path_value), 5, 0, 1, 2)
+
+        self.repair_mpv_button = QPushButton("Repair mpv")
+        self.repair_mpv_button.setObjectName("ghostButton")
+        self.repair_mpv_button.clicked.connect(self.repairMpvRequested)
+        layout.addWidget(self.repair_mpv_button, 6, 0, 1, 2)
+
+        layout.addLayout(self._build_tool_row("yt-dlp status", self.yt_dlp_status_value), 7, 0, 1, 2)
+        layout.addLayout(self._build_tool_row("yt-dlp version", self.yt_dlp_version_value), 8, 0, 1, 2)
+        layout.addLayout(self._build_tool_row("yt-dlp path", self.yt_dlp_path_value), 9, 0, 1, 2)
+
+        self.update_yt_dlp_button = QPushButton("Update yt-dlp now")
+        self.update_yt_dlp_button.setObjectName("primaryButton")
+        self.update_yt_dlp_button.clicked.connect(self.updateYtDlpRequested)
+        layout.addWidget(self.update_yt_dlp_button, 10, 0, 1, 2)
+
+        row = self._build_switch_row("Auto-update yt-dlp", "Check at startup at most once every 24 hours.")
+        self.yt_dlp_auto_update_switch = row.findChild(ToggleSwitch)
+        self.yt_dlp_auto_update_switch.setChecked(self._settings_bool(settings.get("yt_dlp_auto_update", True)))
+        self.yt_dlp_auto_update_switch.toggled.connect(self.ytDlpAutoUpdateChanged)
+        layout.addWidget(row, 11, 0, 1, 2)
+
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 4, 0, 0)
+        action_row.setSpacing(10)
+        self.open_media_tools_button = QPushButton("Open media tools folder")
+        self.open_media_tools_button.setObjectName("ghostButton")
+        self.open_media_tools_button.clicked.connect(self.openMediaToolsFolderRequested)
+        self.copy_media_tools_button = QPushButton("Copy media tools report")
+        self.copy_media_tools_button.setObjectName("ghostButton")
+        self.copy_media_tools_button.clicked.connect(self.copyMediaToolsReportRequested)
+        action_row.addWidget(self.open_media_tools_button)
+        action_row.addWidget(self.copy_media_tools_button)
+        layout.addLayout(action_row, 12, 0, 1, 2)
+        layout.addWidget(self.media_tools_note, 13, 0, 1, 2)
+        return card
+
+    def _build_switch_row(self, title: str, detail: str) -> QWidget:
+        row = QWidget()
+        row.setObjectName("switchRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(12)
+        text_column = QVBoxLayout()
+        text_column.setContentsMargins(0, 0, 0, 0)
+        text_column.setSpacing(2)
+        title_label = QLabel(title)
+        title_label.setObjectName("switchTitle")
+        detail_label = QLabel(detail)
+        detail_label.setObjectName("inlineNote")
+        detail_label.setWordWrap(True)
+        text_column.addWidget(title_label)
+        text_column.addWidget(detail_label)
+        switch = ToggleSwitch()
+        layout.addLayout(text_column, 1)
+        layout.addWidget(switch, 0)
+        return row
+
+    def _build_tool_value(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("toolValue")
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(label.textInteractionFlags() | Qt.TextSelectableByMouse)
+        return label
+
+    def _build_tool_row(self, title: str, value_label: QLabel) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        title_label = QLabel(title)
+        title_label.setObjectName("toolLabel")
+        title_label.setMinimumWidth(92)
+        row.addWidget(title_label, 0)
+        row.addWidget(value_label, 1)
+        return row
 
     def _on_audio_changed(self) -> None:
         self._update_audio_custom_visibility()
@@ -243,7 +344,39 @@ class SettingsPanel(QWidget):
         return YTDL_FORMATS.get(self.streaming_quality(), YTDL_FORMATS["1080p"])
 
     def playback_notifications_enabled(self) -> bool:
-        return self.playback_notifications_check.isChecked()
+        return self.playback_notifications_switch.isChecked()
+
+    def yt_dlp_auto_update_enabled(self) -> bool:
+        return self.yt_dlp_auto_update_switch.isChecked()
+
+    def set_streaming_quality(self, quality: str) -> None:
+        index = self.streaming_quality_combo.findData(quality)
+        if index >= 0:
+            self.streaming_quality_combo.setCurrentIndex(index)
+
+    def set_media_tools_status(self, payload: dict[str, str]) -> None:
+        self.mpv_status_value.setText(payload.get("mpv_status", "Unknown"))
+        self.mpv_version_value.setText(payload.get("mpv_version", "Unknown"))
+        self.mpv_path_value.setText(payload.get("mpv_path", "Unknown"))
+        self.yt_dlp_status_value.setText(payload.get("yt_dlp_status", "Unknown"))
+        self.yt_dlp_version_value.setText(payload.get("yt_dlp_version", "Unknown"))
+        self.yt_dlp_path_value.setText(payload.get("yt_dlp_path", "Unknown"))
+        self.media_tools_note.setText(payload.get("note", "Media tool status refreshed."))
+
+    def media_tools_report(self) -> str:
+        return "\n".join(
+            [
+                f"mpv status: {self.mpv_status_value.text()}",
+                f"mpv version: {self.mpv_version_value.text()}",
+                f"mpv path: {self.mpv_path_value.text()}",
+                f"yt-dlp status: {self.yt_dlp_status_value.text()}",
+                f"yt-dlp version: {self.yt_dlp_version_value.text()}",
+                f"yt-dlp path: {self.yt_dlp_path_value.text()}",
+                f"yt-dlp auto-update: {self.yt_dlp_auto_update_enabled()}",
+                f"streaming quality: {self.streaming_quality()}",
+                f"ytdl-format: {self.ytdl_format()}",
+            ]
+        )
 
     @staticmethod
     def _audio_mode_from_legacy(value: str) -> str:

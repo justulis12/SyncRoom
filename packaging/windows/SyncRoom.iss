@@ -1,6 +1,6 @@
 #define MyAppName "SyncRoom"
 ; Keep MyAppVersion in sync with pyproject.toml and src/syncroom/__init__.py.
-#define MyAppVersion "0.1.34"
+#define MyAppVersion "0.1.35"
 #define MyAppPublisher "justys"
 #define MyAppExeName "SyncRoom.exe"
 
@@ -17,6 +17,7 @@ OutputBaseFilename=SyncRoom-Setup
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=packaging\windows\syncroom.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 SourceDir=..\..
 
@@ -57,8 +58,8 @@ Type: filesandordirs; Name: "{app}\runtime"
 Type: filesandordirs; Name: "{app}\portable_config"
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
